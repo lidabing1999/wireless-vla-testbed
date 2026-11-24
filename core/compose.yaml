@@ -1,0 +1,151 @@
+x-nf: &nf
+  labels:
+    lab.core-config: ${CORE_CONFIG_HASH:?required}
+  environment:
+    TZ: UTC
+  restart: unless-stopped
+
+services:
+  mysql:
+    image: mysql:9.6@sha256:c5df04bee1a42b74a5841c6409e669cf62126cd0416f00c1cea8ab933b9361b9
+    environment:
+      TZ: UTC
+      MYSQL_DATABASE: oai_db
+      MYSQL_USER: test
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?required}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?required}
+      SUBSCRIBER_HASH: ${SUBSCRIBER_HASH:?required}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ${CORE_RUNTIME:?required}/schema.sql:/docker-entrypoint-initdb.d/10-schema.sql:ro
+      - ${CORE_RUNTIME:?required}/subscriber.sql:/docker-entrypoint-initdb.d/20-subscriber.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - MYSQL_PWD="$$MYSQL_PASSWORD" mysql --protocol=tcp -h 127.0.0.1 -u "$$MYSQL_USER" -N "$$MYSQL_DATABASE" -e 'SELECT SHA2(CONCAT(ueid,encPermanentKey,encOpcKey),256) FROM AuthenticationSubscription' | grep -Fqx "$$SUBSCRIBER_HASH"
+      interval: 5s
+      timeout: 4s
+      retries: 20
+      start_period: 15s
+    restart: unless-stopped
+    networks:
+      data:
+        ipv4_address: ${MYSQL_IP}
+
+  oai-nrf:
+    <<: *nf
+    image: oaisoftwarealliance/oai-nrf:v2.2.1@sha256:5b8da12e26b703adaafc422aa1a77736fa1b16f3b340fa8f0f5034da0cc796de
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-nrf/etc/config.yaml:ro
+    networks:
+      data:
+        ipv4_address: ${NRF_IP}
+
+  oai-udr:
+    <<: *nf
+    image: oaisoftwarealliance/oai-udr:v2.2.1@sha256:c9aaa39f0b0b96969fe968fd2c3e84ad7dcd4a50fcee83bd5abde6d6d4a31695
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-udr/etc/config.yaml:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      oai-nrf:
+        condition: service_healthy
+    networks:
+      data:
+        ipv4_address: ${UDR_IP}
+
+  oai-udm:
+    <<: *nf
+    image: oaisoftwarealliance/oai-udm:v2.2.1@sha256:464d5183034983e9bed47f591b6b03a7374a0aef8a7c84b48a437141bb3ee798
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-udm/etc/config.yaml:ro
+    depends_on:
+      - oai-udr
+    networks:
+      data:
+        ipv4_address: ${UDM_IP}
+
+  oai-ausf:
+    <<: *nf
+    image: oaisoftwarealliance/oai-ausf:v2.2.1@sha256:ff3fe0537f05de798519ba303a40ed0a0284da5ddd265d8392e8fd7a3afef3cc
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-ausf/etc/config.yaml:ro
+    depends_on:
+      - oai-udm
+    networks:
+      data:
+        ipv4_address: ${AUSF_IP}
+
+  oai-amf:
+    <<: *nf
+    image: oaisoftwarealliance/oai-amf:v2.2.1@sha256:c6dee19b65b2bf29b73e6647f98e0381d96a2eb4c6f9a68f5c3bc70534afa14c
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-amf/etc/config.yaml:ro
+    depends_on:
+      mysql:
+        condition: service_healthy
+      oai-nrf:
+        condition: service_healthy
+      oai-ausf:
+        condition: service_started
+    networks:
+      data:
+        ipv4_address: ${AMF_IP}
+
+  oai-smf:
+    <<: *nf
+    image: oaisoftwarealliance/oai-smf:v2.2.1@sha256:c1f1452edfc835c36aa96a2efca337da0149212a6561bbb5f9b1994356beee24
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-smf/etc/config.yaml:ro
+    depends_on:
+      - oai-nrf
+      - oai-amf
+    networks:
+      data:
+        ipv4_address: ${SMF_IP}
+
+  oai-upf:
+    <<: *nf
+    image: oaisoftwarealliance/oai-upf:v2.2.1@sha256:03985036c2477a75755ded9b7fe9508b62f49e4ce9e9f059bbb68af63932e7f7
+    volumes:
+      - ${CORE_RUNTIME}/config.yaml:/openair-upf/etc/config.yaml:ro
+    privileged: true
+    depends_on:
+      - oai-nrf
+      - oai-smf
+    networks:
+      data:
+        ipv4_address: ${UPF_IP}
+
+  ext-dn:
+    <<: *nf
+    image: oaisoftwarealliance/trf-gen-cn5g@sha256:3f9ab2e401d2a010b568e78db087b5d1526b8756f1056087939116f6138340a6
+    cap_add:
+      - NET_ADMIN
+    init: true
+    entrypoint:
+      - /bin/bash
+      - -ec
+      - ip route replace 10.0.0.0/16 via ${UPF_IP} dev eth0 && exec iperf3 -s
+    healthcheck:
+      test: ["CMD-SHELL", "ip route show 10.0.0.0/16 | grep -q via && kill -0 1 && pgrep iperf3 >/dev/null"]
+      interval: 5s
+      timeout: 2s
+      retries: 12
+    networks:
+      data:
+        ipv4_address: ${DN_IP}
+
+networks:
+  data:
+    name: ${CORE_NETWORK:?required}
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: ${BRIDGE_IF:?required}
+    ipam:
+      config:
+        - subnet: ${BRIDGE_SUBNET:?required}
+
+volumes:
+  mysql-data:

@@ -1,0 +1,38 @@
+services:
+  policy:
+    image: ${POLICY_IMAGE:?required}
+    build:
+      context: ${EDGE_CONTEXT:?required}
+      args:
+        PIP_INDEX_URL: ${POLICY_PIP_INDEX:-https://pypi.org/simple}
+        POLICY_WHEEL_ORIGIN: ${POLICY_WHEEL_ORIGIN:-https://files.pythonhosted.org}
+    environment:
+      OPENPI_DATA_HOME: /openpi_assets
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      IS_DOCKER: "true"
+    volumes:
+      - ${MODEL_CACHE:?required}:/openpi_assets
+    ports:
+      - "127.0.0.1:${POLICY_HOST_PORT:-8000}:8000"
+    networks:
+      data:
+        ipv4_address: ${POLICY_IP:?required}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${NVIDIA_GPU:?required}"]
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "/.venv/bin/python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3).close()"]
+      interval: 5s
+      timeout: 4s
+      start_period: 30m
+      retries: 12
+    restart: unless-stopped
+
+networks:
+  data:
+    external: true
+    name: ${CORE_NETWORK:?required}

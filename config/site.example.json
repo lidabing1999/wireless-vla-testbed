@@ -1,0 +1,13 @@
+{
+  "ran_ip": "192.0.2.10",
+  "edge_ip": "192.0.2.20",
+  "tunnel_subnet": "172.31.250.0/30",
+  "bridge_subnet": "192.168.70.128/26",
+  "project": "wireless-vla",
+  "bridge": "vla-cn5g",
+  "tunnel": "vla-n2n3",
+  "ue_namespace": "vla-ue",
+  "gpu": "0",
+  "policy_host_port": 8000,
+  "mujoco_gl": "egl"
+}

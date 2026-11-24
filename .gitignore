@@ -1,0 +1,10 @@
+/local/
+/.state/
+/runs/
+__pycache__/
+*.py[cod]
+.env
+*.pcap
+*.pcapng
+*.whl
+.DS_Store

@@ -1,0 +1,52 @@
+"""Render runtime-only Compose inputs and manage the two service groups."""
+import hashlib
+import os
+from pathlib import Path
+
+from common import ROOT, RUNTIME, command, lock, render, subscriber_values, write_file
+from install import stage_edge
+
+
+def compose(role, site, *args, context=None):
+    runtime = RUNTIME / role / site["project"]
+    runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
+    project = f"{site['project']}-{role}"
+    addrs = site["addresses"]
+    env = {
+        "CORE_NETWORK": f"{site['project']}-data",
+        "BRIDGE_IF": site["bridge"],
+        "BRIDGE_SUBNET": site["bridge_subnet"],
+        **{f"{key}_IP": ip for key, ip in addrs.items()},
+    }
+    with lock(runtime / "compose.lock"):
+        if role == "core":
+            config = render("core/config.yaml.in", {"DB_PASSWORD": site["db_password"], "IMS_SLOT": addrs["IMS_SLOT"]})
+            schema = (ROOT / "core/schema.sql").read_text()
+            subscriber = render("core/subscriber.sql.in", subscriber_values(site))
+            for name, content in (("config.yaml", config), ("schema.sql", schema), ("subscriber.sql", subscriber)):
+                # MySQL drops privileges after the directory bind is mounted.
+                write_file(runtime / name, content, 0o444)
+            expected = hashlib.sha256((site["imsi"] + site["k"] + site["opc"]).encode()).hexdigest()
+            env |= {"CORE_RUNTIME": str(runtime), "MYSQL_PASSWORD": site["db_password"],
+                    "MYSQL_ROOT_PASSWORD": site["db_root_password"], "SUBSCRIBER_HASH": expected,
+                    "CORE_CONFIG_HASH": hashlib.sha256(config.encode()).hexdigest()}
+        else:
+            cache = Path(os.environ.get("VLA_MODEL_CACHE", RUNTIME / "edge/model-cache")).expanduser().resolve()
+            cache.mkdir(parents=True, exist_ok=True)
+            env |= {"EDGE_CONTEXT": str(context or RUNTIME / "edge/context"),
+                    "POLICY_IMAGE": os.environ.get("VLA_POLICY_IMAGE", f"{site['project']}-openpi:pi05-215abfb"),
+                    "MODEL_CACHE": str(cache), "NVIDIA_GPU": site["gpu"],
+                    "POLICY_HOST_PORT": str(site["policy_host_port"])}
+        command("docker", "compose", "--project-name", project, "--env-file", "/dev/null",
+                "-f", ROOT / role / "compose.yaml", *args, env=os.environ | env)
+
+
+def prepare(role, site):
+    if role == "core":
+        compose("core", site, "pull")
+    else:
+        if "VLA_POLICY_IMAGE" in os.environ:
+            command("docker", "image", "inspect", os.environ["VLA_POLICY_IMAGE"], "--format", "{{.Id}}")
+        else:
+            context = stage_edge()
+            compose("edge", site, "build", context=context)
