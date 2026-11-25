@@ -21,7 +21,7 @@ channelmod:
     ds_tdl: 0
 vrtsim:
   role: client
-  ue_id: 0
+  ue_id: @SLOT@
   chanmod: 0
   cirdb: 0
   connection_descriptor: /tmp/oai-vla-vrtsim

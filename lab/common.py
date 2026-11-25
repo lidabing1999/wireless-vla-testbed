@@ -5,6 +5,7 @@ import ipaddress
 import json
 import os
 import re
+import secrets
 import subprocess
 import tempfile
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / ".state"
 SITE_DEFAULT = ROOT / "local/site.json"
 UE_DEVICE = "oaitun_ue1"
+MAX_UES = 16  # MAX_MOBILES_PER_GNB in the pinned OAI build
 POLICY_PORT = 8000
 DEFAULTS = json.loads((ROOT / "config/site.example.json").read_text())
 OFFSETS = {"NRF": 2, "MYSQL": 3, "AMF": 4, "SMF": 5, "UPF": 6, "DN": 7,
@@ -32,7 +34,7 @@ def load_site(path):
     if topology == "dual":
         required.update(("ran_ip", "edge_ip"))
     missing = required - site.keys()
-    unknown = site.keys() - DEFAULTS.keys() - required
+    unknown = site.keys() - DEFAULTS.keys() - required - {"additional_ues"}
     if missing or unknown:
         raise ValueError(f"site fields missing {sorted(missing)} or unknown {sorted(unknown)}")
     site = DEFAULTS | site | {"topology": topology}
@@ -69,6 +71,17 @@ def load_site(path):
                          ("db_root_password", r"[A-Za-z0-9_-]{16,128}")):
         if not re.fullmatch(pattern, site[key]):
             raise ValueError(f"invalid format for {key}")
+    extras = site.get("additional_ues", [])
+    if not isinstance(extras, list) or len(extras) >= MAX_UES:
+        raise ValueError("invalid additional_ues list")
+    identities = {site["imsi"]}
+    for ue in extras:
+        if (not isinstance(ue, dict) or set(ue) != {"imsi", "k", "opc"}
+                or not isinstance(ue["imsi"], str) or not re.fullmatch(r"00101[0-9]{10}", ue["imsi"])
+                or any(not isinstance(ue[k], str) or not re.fullmatch(r"[0-9a-fA-F]{32}", ue[k]) for k in ("k", "opc"))
+                or ue["imsi"] in identities):
+            raise ValueError("additional UEs need distinct IMSIs and valid K/OPc")
+        identities.add(ue["imsi"])
     site["bridge_gateway"] = str(bridge.network_address + 1)
     if topology == "dual":
         site["ran_ip"], site["edge_ip"] = map(str, underlay)
@@ -119,6 +132,24 @@ def render(relative, values):
 
 def subscriber_values(site):
     return {"IMSI": site["imsi"], "K": site["k"], "OPC": site["opc"]}
+
+
+def terminals(site):
+    return [dict(slot=slot, namespace=(site["ue_namespace"] if slot == 0 else
+                 f"{site['ue_namespace']}-{slot + 1}"), **subscriber_values(ue))
+            for slot, ue in enumerate([site, *site.get("additional_ues", [])])]
+
+
+def extend_ues(data, count):
+    extras = data.setdefault("additional_ues", [])
+    if not 1 + len(extras) <= count <= MAX_UES:
+        raise ValueError("choose the existing UE count or a larger count")
+    identities = {data["imsi"], *(ue["imsi"] for ue in extras)}
+    while len(identities) < count:
+        imsi = f"00101{secrets.randbelow(10**10):010}"
+        if imsi not in identities:
+            extras.append(dict(imsi=imsi, k=secrets.token_hex(16), opc=secrets.token_hex(16)))
+            identities.add(imsi)
 
 
 def command(*args, **options):

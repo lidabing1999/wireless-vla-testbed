@@ -7,10 +7,10 @@ import containers
 import host
 import install
 import simulation
-from common import ROOT, RUNTIME, command, lock, status, sudo
+from common import ROOT, RUNTIME, UE_DEVICE, command, lock, status, sudo, terminals
 
 
-def systemd_radio(action, site, site_path=None):
+def systemd_radio(action, site, site_path=None, timeout=120):
     unit = f"{site['project']}-radio.service"
     if action == "stop":
         # A collected transient unit can be absent after a clean stop or reboot.
@@ -21,10 +21,10 @@ def systemd_radio(action, site, site_path=None):
         command(*sudo(["systemd-run", f"--unit={unit}", "--collect", "--service-type=exec",
                        "--property=KillMode=mixed", "--property=TimeoutStopSec=20s",
                        "--", ROOT / "bin/lab", "--site", site_path, "radio", "both"]))
-    deadline = time.monotonic() + 110
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline and status("systemctl", "is-active", "--quiet", unit) == 0:
-        if status(*sudo(["ip", "-n", site["ue_namespace"], "route", "get",
-                         site["addresses"]["POLICY"]])) == 0:
+        if all(status(*sudo(["ip", "-n", ue["namespace"], "route", "get",
+                             site["addresses"]["POLICY"], "oif", UE_DEVICE])) == 0 for ue in terminals(site)):
             print(f"Radio service ready: {unit}", flush=True)
             return
         time.sleep(2)

@@ -16,7 +16,7 @@ import install
 import network
 import radio
 import simulation
-from common import DEFAULTS, ROOT, SITE_DEFAULT, command, load_site
+from common import DEFAULTS, MAX_UES, ROOT, SITE_DEFAULT, command, extend_ues, load_site, lock, terminals, write_file
 
 HOST_ROLES = ("core", "edge", "ran", "sim")
 
@@ -48,6 +48,10 @@ def arguments():
     init.add_argument("--ue-namespace", default=DEFAULTS["ue_namespace"])
     init.add_argument("--policy-host-port", type=bounded(1024, 65535), default=8000)
     init.add_argument("--mujoco-gl", choices=("egl", "osmesa"))
+    init.add_argument("--ue-count", type=bounded(1, MAX_UES), default=1)
+    expand = actions.add_parser("ues", help="extend the UE roster in an existing private site file")
+    expand.add_argument("count", type=bounded(1, MAX_UES))
+    actions.add_parser("subscribers", help="apply the site subscriptions to the running core database")
     actions.add_parser("plan", help="show addresses and names without credentials")
     deployment = actions.add_parser("deploy", help="install, build and start from a clean Ubuntu host")
     deployment.add_argument("role", choices=("all", *HOST_ROLES), nargs="?", default="all")
@@ -68,7 +72,7 @@ def arguments():
                             ("status", "list runtime container status"),
                             ("validate", "render and validate Compose configuration")):
         part = actions.add_parser(name, help=help_text)
-        part.add_argument("role", choices=("core", "edge", "ran") if name in ("down", "status") else ("core", "edge"))
+        part.add_argument("role", choices=("core", "edge", "ran") if name != "validate" else ("core", "edge"))
         if name == "up":
             part.add_argument("--timeout", type=bounded(1, 7200))
 
@@ -83,8 +87,23 @@ def arguments():
     sim_actions.add_parser("check", help="render one local frame with no policy server")
     probe = sim_actions.add_parser("probe", help="verify policy HTTP health over the UE TUN")
     probe.add_argument("--throughput", action="store_true", help="also run uplink and downlink iperf3")
+    probe.add_argument("--ue", type=bounded(1, MAX_UES), default=1)
     episode = sim_actions.add_parser("run", help="record one LIBERO episode")
     episode.add_argument("preset", choices=simulation.PRESETS, default="bowl", nargs="?")
+    episode.add_argument("--ue", type=bounded(1, MAX_UES), default=1)
+    episode.add_argument("--clock", choices=("blocking", "realtime"), default="blocking")
+    multi = sim_actions.add_parser("multi", help="run one 20 Hz LIBERO environment per UE")
+    multi.add_argument("presets", nargs="*", metavar="TASK", help="one shared task or one task per UE")
+    for target in (multi, episode):
+        episode_options(target)
+    episode.add_argument("--host", help="use a direct control path for comparison")
+    episode.add_argument("--port", type=bounded(1, 65535), default=8000, help="direct endpoint port")
+    return parser.parse_args()
+
+
+def episode_options(episode):
+    episode.add_argument("--max-control-steps", type=bounded(1, 10000),
+                         help="episode horizon after warmup, including all hold steps (default: suite horizon)")
     episode.add_argument("--suite", choices=("libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"))
     episode.add_argument("--task", type=bounded(0, 99))
     episode.add_argument("--init-state", type=bounded(0, 999), default=0)
@@ -92,12 +111,9 @@ def arguments():
     episode.add_argument("--replan-steps", type=bounded(1, 10), default=5)
     episode.add_argument("--timeout", type=bounded(1, 7200), default=290)
     episode.add_argument("--output", default=str(ROOT / "runs"))
-    episode.add_argument("--host", help="use a direct control path for comparison")
-    episode.add_argument("--port", type=bounded(1, 65535), default=8000, help="direct endpoint port")
-    return parser.parse_args()
 
 
-def init_site(path, overrides):
+def init_site(path, overrides, count=1):
     path = path.expanduser()
     if path.exists():
         raise ValueError(f"{path} already exists")
@@ -110,6 +126,7 @@ def init_site(path, overrides):
     data.update({"imsi": f"00101{secrets.randbelow(10**10):010}",
                  "k": secrets.token_hex(16), "opc": secrets.token_hex(16),
                  "db_password": secrets.token_hex(20), "db_root_password": secrets.token_hex(20)})
+    extend_ues(data, count)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as handle:
@@ -154,7 +171,7 @@ def main():
         if topology == "dual" and not (args.ran_ip and args.edge_ip):
             raise ValueError("a dual-host site requires both --ran-ip and --edge-ip")
         values = {key: getattr(args, key) for key in DEFAULTS}
-        init_site(args.site, values | {"topology": topology})
+        init_site(args.site, values | {"topology": topology}, args.ue_count)
         return
     if action == "doctor":
         doctor(args.role)
@@ -176,11 +193,22 @@ def main():
         host.require_ubuntu()
         init_site(site_path, {"topology": "single", "gpu": args.gpu or DEFAULTS["gpu"]})
     site = load_site(site_path)
+    if action == "ues":
+        with lock(site_path.with_suffix(".lock")):
+            data = json.loads(site_path.read_text())
+            extend_ues(data, args.count)
+            write_file(site_path, json.dumps(data, indent=2) + "\n")
+        print(f"Site configured for {args.count} UEs. Copy this private file to the other host.")
+        return
     if action == "plan":
         fields = set(DEFAULTS) | {"ran_tunnel", "core_tunnel", "addresses", "ran_bind", "bridge_gateway"}
-        print(json.dumps({key: value for key, value in site.items() if key in fields}, indent=2))
+        plan = {key: value for key, value in site.items() if key in fields}
+        plan["ue_namespaces"] = [ue["namespace"] for ue in terminals(site)]
+        print(json.dumps(plan, indent=2))
         return
     install.require_linux()
+    if action == "subscribers":
+        return containers.provision(site)
     if action == "deploy":
         if args.gpu is not None and site["gpu"] != args.gpu:
             raise ValueError("edit gpu in the existing site configuration to change devices")
@@ -191,7 +219,10 @@ def main():
         containers.compose(args.role, site, "config", "--quiet")
         print(f"{args.role}: Compose configuration valid.")
     elif action == "up":
-        containers.up(args.role, site, args.timeout)
+        if args.role == "ran":
+            deploy.systemd_radio("start", site, site_path, args.timeout or 120)
+        else:
+            containers.up(args.role, site, args.timeout)
     elif action == "down":
         if args.role == "ran":
             deploy.systemd_radio("stop", site)
@@ -211,10 +242,13 @@ def main():
         radio.run(site, args.component, args.profile)
     elif args.simulation == "check":
         simulation.check(site)
+    elif args.simulation == "multi":
+        signal.signal(signal.SIGTERM, lambda _signal, _frame: signal.raise_signal(signal.SIGINT))
+        return simulation.multi(site, site_path, args)
     elif args.simulation == "probe":
-        simulation.probe(site, args.throughput)
+        simulation.probe(simulation.ue_site(site, args.ue), args.throughput)
     else:
-        return simulation.run(site, args)
+        return simulation.run(simulation.ue_site(site, args.ue), args)
 
 
 if __name__ == "__main__":

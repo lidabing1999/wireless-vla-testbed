@@ -17,6 +17,7 @@ from openpi_client import image_tools
 from openpi_client import websocket_client_policy as _websocket_client_policy
 import tqdm
 import tyro
+from realtime import RealtimeControl
 
 LIBERO_DUMMY_ACTION = [0.0] * 6 + [-1.0]
 LIBERO_ENV_RESOLUTION = 256  # resolution used to render training data
@@ -31,6 +32,8 @@ class Args:
     port: int = 8000
     resize_size: int = 224
     replan_steps: int = 5
+    clock: str = "blocking"
+    max_control_steps: int | None = None
 
     #################################################################################################################
     # LIBERO environment-specific parameters
@@ -60,7 +63,8 @@ def eval_libero(args: Args) -> None:
     num_tasks_in_suite = task_suite.n_tasks
     logging.info(f"Task suite: {args.task_suite_name}")
 
-    pathlib.Path(args.video_out_path).mkdir(parents=True, exist_ok=True)
+    output_dir = pathlib.Path(args.video_out_path)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     if args.task_suite_name == "libero_spatial":
         max_steps = 220  # longest training demo has 193 steps
@@ -75,6 +79,8 @@ def eval_libero(args: Args) -> None:
     else:
         raise ValueError(f"Unknown task suite: {args.task_suite_name}")
 
+    if args.max_control_steps is not None:
+        max_steps = args.max_control_steps
     client = _websocket_client_policy.WebsocketClientPolicy(args.host, args.port)
 
     # Start evaluation
@@ -109,14 +115,20 @@ def eval_libero(args: Args) -> None:
             replay_images = []
             done = False
             rollout_error = None
+            trace_name = ("control.jsonl" if args.num_trials_per_task == 1 and args.task_id >= 0
+                          else f"control-task{task_id}-trial{episode_idx}.jsonl")
+            clock = RealtimeControl(output_dir / trace_name) if args.clock == "realtime" else None
 
             logging.info(f"Starting episode {task_episodes+1}...")
             while t < max_steps + args.num_steps_wait:
                 try:
+                    if clock:
+                        clock.release()
                     # IMPORTANT: Do nothing for the first few timesteps because the simulator drops objects
                     # and we need to wait for them to fall
                     if t < args.num_steps_wait:
-                        obs, reward, done, info = env.step(LIBERO_DUMMY_ACTION)
+                        obs, reward, done, info = (clock.step(env, LIBERO_DUMMY_ACTION, "warmup")
+                                                  if clock else env.step(LIBERO_DUMMY_ACTION))
                         t += 1
                         continue
 
@@ -151,7 +163,18 @@ def eval_libero(args: Args) -> None:
                         }
 
                         # Query model to get action
-                        action_chunk = client.infer(element)["actions"]
+                        if clock:
+                            if clock.pending is None:
+                                clock.submit(client, element, clock.finished)
+                            action_chunk = clock.receive()
+                            if action_chunk is None:
+                                obs, reward, done, info = clock.step(env, clock.hold(), "hold")
+                                t += 1
+                                if done:
+                                    break
+                                continue
+                        else:
+                            action_chunk = client.infer(element)["actions"]
                         assert (
                             len(action_chunk) >= args.replan_steps
                         ), f"We want to replan every {args.replan_steps} steps, but policy only predicts {len(action_chunk)} steps."
@@ -160,10 +183,9 @@ def eval_libero(args: Args) -> None:
                     action = action_plan.popleft()
 
                     # Execute action in environment
-                    obs, reward, done, info = env.step(action.tolist())
+                    obs, reward, done, info = (clock.step(env, action.tolist(), "policy")
+                                               if clock else env.step(action.tolist()))
                     if done:
-                        task_successes += 1
-                        total_successes += 1
                         break
                     t += 1
 
@@ -172,11 +194,15 @@ def eval_libero(args: Args) -> None:
                     logging.error(f"Caught exception: {e}")
                     break
 
+            if clock:
+                clock.close()
             task_episodes += 1
             total_episodes += 1
 
             # Save a replay video of the episode
             done = bool(env.check_success()) and rollout_error is None
+            task_successes += int(done)
+            total_successes += int(done)
             suffix = "success" if done else "failure"
             terminal_image = np.ascontiguousarray(obs["agentview_image"][::-1, ::-1])
             terminal_video_image = image_tools.convert_to_uint8(
@@ -184,7 +210,6 @@ def eval_libero(args: Args) -> None:
             )
             replay_images.append(terminal_video_image)
             run_id = f"task{task_id}_trial{episode_idx}_seed{args.seed}_{uuid.uuid4().hex[:12]}"
-            output_dir = pathlib.Path(args.video_out_path)
             imageio.imwrite(output_dir / f"{run_id}_{suffix}_terminal.png", terminal_image)
             for label, fraction in [("start", 0.0), ("middle", 0.5)]:
                 frame_id = round(fraction * (len(replay_images) - 1))
@@ -197,7 +222,7 @@ def eval_libero(args: Args) -> None:
             imageio.mimwrite(
                 pathlib.Path(args.video_out_path) / f"{run_id}_{task_segment}_{suffix}.mp4",
                 [np.asarray(x) for x in replay_images],
-                fps=10,
+                fps=20 if clock else 10,
             )
 
             # Log current results

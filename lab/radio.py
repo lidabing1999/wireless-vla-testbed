@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
 
-from common import RUNTIME, UE_DEVICE, command, lock, output, render, subscriber_values, write_file
+from common import RUNTIME, UE_DEVICE, command, lock, output, render, terminals, write_file
 from network import sudo_required, verify_ran
 
 # Kernel tunnel modules can create down fallback devices in every new netns.
@@ -68,7 +68,7 @@ def run(site, component, profile):
     base = Path("/run") / ("wvla-" + site["project"])
     base.mkdir(mode=0o700, exist_ok=True)
     sock = base / "iq.sock"
-    ns = site["ue_namespace"]
+    ues = terminals(site)
     run_dir = RUNTIME / "ran/logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     logs = Path(mkdtemp(prefix=f"{datetime.now():%Y%m%d-%H%M%S}-{component}-", dir=run_dir))
@@ -82,8 +82,10 @@ def run(site, component, profile):
                     raise ValueError(f"{modem} already runs on this host")
         children = []
         if gnb:
+            slot_config = "  - antennas: 2x2\n    model_id: 0\n    ds_ns: 1.0\n    speed_mps: 1.5"
             config = render("ran/gnb.yaml.in", {"AMF_IP": site["addresses"]["AMF"],
-                                              "RAN_BIND_IP": site["ran_bind"]})
+                                              "RAN_BIND_IP": site["ran_bind"], "UE_COUNT": str(len(ues)),
+                                              "UE_CONFIG": "\n".join(slot_config for _ in ues)})
             if profile == "ul32":
                 mask = ",".join(map(str, range(32, 98)))
                 config = re.sub(r"(?m)^(- gNB_ID:.*)$", rf'\1\n  ul_prbblacklist: "{mask}"', config)
@@ -97,7 +99,7 @@ def run(site, component, profile):
             if sock.exists() or sock.is_symlink():
                 raise ValueError(f"VRTSIM socket path is occupied: {sock}")
             child = start([build / "nr-softmodem", "-O", conf, "-E", "--device.name", "vrtsim",
-                           "--vrtsim.role", "server", "--vrtsim.timescale", "1.0", "--vrtsim.num_ues", "1",
+                           "--vrtsim.role", "server", "--vrtsim.timescale", "1.0", "--vrtsim.num_ues", str(len(ues)),
                            "--vrtsim.chanmod", "0", "--vrtsim.cirdb", "0",
                            "--vrtsim.connection_descriptor", sock], logs, build, "gnb.log")
             children.append(child)
@@ -110,27 +112,33 @@ def run(site, component, profile):
 
         if ue:
             names = {line.split()[0] for line in output("ip", "netns", "list").splitlines()}
-            if ns not in names:
-                command("ip", "netns", "add", ns)
-                stack.callback(remove_unused_namespace, ns)
-            if has_active_or_custom_links(ns):
-                raise ValueError(f"namespace {ns} already contains another configured interface")
-            command("ip", "-n", ns, "link", "set", "lo", "up")
-            conf = logs / "ue.yaml"
-            write_file(conf, render("ran/ue.yaml.in", subscriber_values(site)))
-            child = start(["ip", "netns", "exec", ns, build / "nr-uesoftmodem", "-O", conf,
-                           "-E", "-r", "106", "--numerology", "1", "--band", "78", "-C", "3319680000",
-                           "--device.name", "vrtsim", "--vrtsim.role", "client", "--vrtsim.ue_id", "0",
-                           "--vrtsim.connection_descriptor", sock, "--vrtsim.chanmod", "0",
-                           "--vrtsim.cirdb", "0", "--ue-nb-ant-rx", "2", "--ue-nb-ant-tx", "2"],
-                          logs, build, "ue.log")
-            children.append(child)
-            stack.callback(stop, child)
-            check_until(lambda: ue_ready(ns), 60, "PDU session did not obtain an IPv4 address; check ue.log", children)
-            command("ip", "-n", ns, "link", "set", UE_DEVICE, "mtu", "1300")
-            for key in ("POLICY", "DN"):
-                command("ip", "-n", ns, "route", "replace", f"{site['addresses'][key]}/32", "dev", UE_DEVICE)
-            print(f"UE IPv4 session ready in {ns} on {UE_DEVICE}.", flush=True)
+            for terminal in ues:
+                ns = terminal["namespace"]
+                if ns not in names:
+                    command("ip", "netns", "add", ns)
+                    stack.callback(remove_unused_namespace, ns)
+                if has_active_or_custom_links(ns):
+                    raise ValueError(f"namespace {ns} already contains another configured interface")
+                command("ip", "-n", ns, "link", "set", "lo", "up")
+                ue_logs = logs if len(ues) == 1 else logs / f"ue-{terminal['slot'] + 1}"
+                ue_logs.mkdir(exist_ok=True)
+                conf = ue_logs / "ue.yaml"
+                write_file(conf, render("ran/ue.yaml.in", terminal | {"SLOT": str(terminal["slot"])}))
+                child = start(["ip", "netns", "exec", ns, build / "nr-uesoftmodem", "-O", conf,
+                               "-E", "-r", "106", "--numerology", "1", "--band", "78", "-C", "3319680000",
+                               "--device.name", "vrtsim", "--vrtsim.role", "client", "--vrtsim.ue_id", str(terminal["slot"]),
+                               "--vrtsim.connection_descriptor", sock, "--vrtsim.chanmod", "0",
+                               "--vrtsim.cirdb", "0", "--ue-nb-ant-rx", "2", "--ue-nb-ant-tx", "2"],
+                              ue_logs, build, "ue.log")
+                children.append(child)
+                stack.callback(stop, child)
+            for terminal in ues:
+                ns = terminal["namespace"]
+                check_until(lambda: ue_ready(ns), 90, "PDU session did not obtain an IPv4 address; check ue.log", children)
+                command("ip", "-n", ns, "link", "set", UE_DEVICE, "mtu", "1300")
+                for key in ("POLICY", "DN"):
+                    command("ip", "-n", ns, "route", "replace", f"{site['addresses'][key]}/32", "dev", UE_DEVICE)
+                print(f"UE IPv4 session ready in {ns} on {UE_DEVICE}.", flush=True)
 
         while all(child.poll() is None for child in children):
             time.sleep(0.5)

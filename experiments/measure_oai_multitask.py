@@ -1,8 +1,9 @@
-"""Trace the original blocking LIBERO loop and the OpenPI client timing boundaries."""
+"""Trace LIBERO steps and OpenPI client timing on the same monotonic clock."""
 import json
 import os
 import runpy
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -19,10 +20,12 @@ original_states = benchmark.Benchmark.get_task_init_states
 original_step = OffScreenRenderEnv.step
 step_number = 0
 request_number = 0
+trace_lock = threading.Lock()
 
 
 def record(event, **fields):
-    trace.write(json.dumps({"event": event, **fields}) + "\n")
+    with trace_lock:
+        trace.write(json.dumps({"event": event, **fields}) + "\n")
 
 
 def select_state(self, task_id):
@@ -32,6 +35,7 @@ def select_state(self, task_id):
 def timed_infer(self, observation):
     global request_number
     request_number += 1
+    step_at_start = step_number
     start = time.monotonic_ns()
     data = self._packer.pack(observation)
     packed = time.monotonic_ns()
@@ -51,7 +55,7 @@ def timed_infer(self, observation):
     record(
         "infer",
         number=request_number,
-        step=step_number,
+        step=step_at_start,
         start_ns=start,
         end_ns=end,
         tx_wall_ns=tx_wall,

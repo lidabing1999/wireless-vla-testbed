@@ -4,7 +4,7 @@
 
 项目负责人及实验平台设计 · [@lidabing1999](https://github.com/lidabing1999)
 
-[快速开始](#快速开始) · [系统架构](#系统架构) · [双机部署](#双机部署) · [运行实验](#运行实验) · [验证记录](#验证记录)
+[快速开始](#快速开始) · [系统架构](#系统架构) · [双机部署](#双机部署) · [多终端与多机械臂](#多终端与多机械臂) · [运行实验](#运行实验) · [验证记录](#验证记录)
 
 ## 快速开始
 
@@ -27,9 +27,10 @@ cd wireless-vla-testbed
 ```mermaid
 flowchart LR
     subgraph RADIO["RAN 与仿真"]
-        SIM["LIBERO / MuJoCo"] <-->|WebSocket 观测与动作| TUN["UE 命名空间<br/>oaitun_ue1"]
-        TUN <--> UE["OAI nrUE"]
-        UE <-->|VRTSIM · Unix socket| GNB["OAI gNB"]
+        SIM1["机械臂 1 · LIBERO"] <-->|观测与动作| UE1["命名空间 1 · TUN · OAI nrUE 1"]
+        SIM2["机械臂 2 · LIBERO"] <-->|观测与动作| UE2["命名空间 2 · TUN · OAI nrUE 2"]
+        UE1 <-->|VRTSIM| GNB["共享 OAI gNB"]
+        UE2 <-->|VRTSIM| GNB
     end
     subgraph DATA["5G 核心网与边缘服务 · Docker"]
         AMF["AMF"]
@@ -93,6 +94,39 @@ gNB 和 UE 是 Linux 原生进程。仿真客户端使用 Python 虚拟环境，
 
 `deploy core` 和 `deploy ran` 分别配置本端 IPIP 隧道。只替换 RAN 时，继续使用与原核心网数据库匹配的 IMSI、K 和 OPc。
 
+## 多终端与多机械臂
+
+每台机械臂对应一个独立的 LIBERO/MuJoCo 场景、一个 OAI nrUE 进程、一份移动用户订阅和一个网络命名空间。各 UE 接入同一个 gNB，经各自的 PDU 会话访问同一台 π₀.₅ 服务。这样可以分别测量多台机械臂竞争无线和推理资源时的控制表现。每个场景有自己的物体和任务判定。
+
+新站点在 `lab init` 时添加 `--ue-count 2 --mujoco-gl egl`，然后按双机部署步骤启动。已有站点可以保留主 UE 的订阅和数据库，按下面的顺序扩容。
+
+1. 在保存站点配置的一端运行 `./bin/lab ues 2`，把生成的同一份 `local/site.json` 安全复制到另一端，权限设为 `0600`。重复执行相同数量会保留已有订阅。
+2. 在核心网主机运行 `./bin/lab subscribers`，将新增订阅加载到正在运行的数据库。
+3. 在 RAN 主机等待当前实验结束，依次执行 `./bin/lab down ran` 和 `./bin/lab up ran`，让 gNB 和全部 nrUE 使用新配置。
+
+在 RAN/仿真主机运行以下命令。任务按 UE 编号排列，给一个任务时所有 UE 运行该任务。
+
+```bash
+./bin/lab sim probe --ue 1
+./bin/lab sim probe --ue 2
+./bin/lab sim multi bowl
+./bin/lab sim multi bowl drawer --seed 7 --init-state 0
+./bin/lab sim run bowl --ue 2 --clock realtime
+```
+
+`sim multi` 等待所有场景初始化后，用同一个单调时钟起点按 **20 Hz** 推进。每台臂最多有一个在途请求，动作队列用完时发送最新观测。等待期间每步执行零位姿增量并维持上一夹爪指令。新动作块抵达后在下一个可用控制步执行，默认连续采用前 5 个动作。EGL 用于离屏渲染。每步实际耗时和漏掉的周期由运行时记录。
+
+预热 10 步后，策略动作和等待动作都计入任务步数上限。放碗默认 300 步，即准时运行时有 15 秒完成；抽屉默认 520 步，对应 26 秒。用 `--max-control-steps N` 设置统一的任务预算，`--timeout` 单独限制进程墙钟运行时间。比较完成率时应固定任务预算、初始状态和重规划步数。
+
+| 多机臂运行输出 | 用途 |
+| --- | --- |
+| `runs/<组>/summary.json` | 各 UE 地址、任务、退出码、TUN 上下行字节增量、全部机械臂同时运行的时间 |
+| `ue-N/<回合>/timing.json` | 物理步数、保持与策略动作数、步间隔及推理往返的中位数与 P95、实时因子、漏周期和超期步数 |
+| `ue-N/<回合>/control.jsonl` 与 `trace.jsonl` | 每步的计划/实际时刻、动作来源、请求编号、观测采集完成时刻及推理返回时刻，单位为本机单调时钟纳秒 |
+| `ue-N/<回合>/user-plane.json`、任务 JSON 与 MP4 | 每个 TUN 的起止计数器、LIBERO 目标判定与回放 |
+
+单臂退出码 `0` 表示任务成功，`2` 表示回合正常结束但未达成目标。已有端到端实测规模为 2 UE / 2 臂。固定 OAI 版本允许配置最多 16 个 UE 槽位，更大规模的实际容量取决于主机和负载。
+
 ## 运行实验
 
 ```bash
@@ -114,7 +148,7 @@ gNB 和 UE 是 Linux 原生进程。仿真客户端使用 Python 虚拟环境，
 | 两物入篮 `two-objects` | `libero_10` | 0 |
 | 放碗入抽屉并关上 `drawer` | `libero_10` | 3 |
 
-每个回合目录包含 `condition.json`、任务结果 JSON、录像、关键帧和 `trace.jsonl`。默认使用初始状态 0、种子 7，每次执行返回动作序列的前 5 步。客户端同步等待推理，期间仿真停步。分析时分别统计墙钟时间和仿真时间。
+每个回合目录包含 `condition.json`、任务结果 JSON、录像、关键帧和 `trace.jsonl`。默认使用初始状态 0、种子 7，每次执行返回动作序列的前 5 步。`sim run` 默认沿用阻塞模式，等待推理期间仿真停步。单臂和直连对照可显式传入 `--clock realtime`，使用与 `sim multi` 相同的时钟和等待动作。
 
 前台 gNB 支持 `--profile full`、`--profile ul32`、`--profile dl4`。基线载波配置为 106 PRB。`ul32` 保留连续上行 PRB 0–31 和上侧 PRB 98–105，`dl4` 将 gNB 下行 MCS 上限设为 4。切换档位需要重新启动 gNB 和 UE。
 
@@ -166,6 +200,7 @@ gNB 和 UE 是 Linux 原生进程。仿真客户端使用 Python 虚拟环境，
 | RAN 清洁构建 | 从 Git 子模块取得 OAI、SIMDe 和 ASN.1 编译器，并在 Linux 上编译 gNB、UE 与 VRTSIM。 |
 | 单机 UE 用户面闭环 | 2026-11-25 建立 PDU 会话，通过 `oaitun_ue1` 访问 OpenPI 并完成放碗回合，生成 MP4 和 18 条推理请求记录。此次实测复用了 NVIDIA 驱动、固定核心网镜像和模型权重缓存。 |
 | 双机 UE 用户面闭环 | 2026-11-25 在 RAN 主机编译 gNB 和 UE，运行 LIBERO/MuJoCo，经 IPIP 接入另一台主机上的核心网和 π₀.₅。固定种子 7、初始状态 0 的放碗回合成功，推理期间观测到了双向 N3 流量。 |
+| 双 UE / 双 EGL 机械臂 | 2026-11-26 两个 UE 在同一 gNB 上建立各自的 PDU 会话。两次并发放碗均为两臂成功。第二次两臂共同运行 10.66 秒，步间隔 P95 分别为 50.35 / 50.34 ms，均无漏周期。另两次并发放碗与抽屉实验中，放碗均成功，抽屉在 520 和 900 步预算内均未完成。 |
 
 初次安装 NVIDIA 驱动的流程仍需在带物理 GPU 的空白主机上验证。
 

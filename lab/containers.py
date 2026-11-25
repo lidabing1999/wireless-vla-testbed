@@ -5,12 +5,25 @@ import subprocess
 import time
 from pathlib import Path
 
-from common import ROOT, RUNTIME, command, lock, render, subscriber_values, write_file
+from common import ROOT, RUNTIME, command, lock, render, terminals, write_file
 from host import docker_cli
 from install import stage_edge
 
 
-def compose(role, site, *args, context=None):
+def subscriber_sql(site):
+    rows = [render("core/subscriber.sql.in", ue | {"STATIC_IP": f"10.0.0.{10 + ue['slot']}"})
+            for ue in terminals(site)]
+    return "START TRANSACTION;\n" + "\n".join(rows) + "\nCOMMIT;\n"
+
+
+def provision(site):
+    # Existing MySQL volumes do not run the init scripts again. Preserve AKA sequence numbers.
+    compose("core", site, "exec", "-T", "mysql", "sh", "-ec",
+            'MYSQL_PWD="$MYSQL_PASSWORD" exec mysql -u "$MYSQL_USER" "$MYSQL_DATABASE"',
+            stdin_data=subscriber_sql(site))
+
+
+def compose(role, site, *args, context=None, stdin_data=None):
     runtime = RUNTIME / role / site["project"]
     runtime.mkdir(parents=True, exist_ok=True, mode=0o700)
     project = f"{site['project']}-{role}"
@@ -25,7 +38,7 @@ def compose(role, site, *args, context=None):
         if role == "core":
             config = render("core/config.yaml.in", {"DB_PASSWORD": site["db_password"], "IMS_SLOT": addrs["IMS_SLOT"]})
             schema = (ROOT / "core/schema.sql").read_text()
-            subscriber = render("core/subscriber.sql.in", subscriber_values(site))
+            subscriber = subscriber_sql(site)
             for name, content in (("config.yaml", config), ("schema.sql", schema), ("subscriber.sql", subscriber)):
                 # MySQL drops privileges after the directory bind is mounted.
                 write_file(runtime / name, content, 0o444)
@@ -46,7 +59,8 @@ def compose(role, site, *args, context=None):
         rows = [key + "='" + value.replace("'", "\\'") + "'\n" for key, value in env.items()]
         write_file(compose_env, "".join(rows))
         command(*docker_cli(), "compose", "--project-name", project, "--env-file", compose_env,
-                "-f", ROOT / role / "compose.yaml", *args, env=os.environ | env)
+                "-f", ROOT / role / "compose.yaml", *args, env=os.environ | env,
+                input=stdin_data, text=True)
 
 
 def prepare(role, site):
@@ -71,3 +85,5 @@ def up(role, site, timeout=None):
     wait = timeout or (240 if role == "core" else 2400)
     extra = ["--no-build"] if role == "edge" else []
     compose(role, site, "up", "-d", *extra, "--wait", "--wait-timeout", str(wait))
+    if role == "core" and site.get("additional_ues"):
+        provision(site)

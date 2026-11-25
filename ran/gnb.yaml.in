@@ -130,12 +130,9 @@ vrtsim:
   cirdb_file: /cirdb/cir_db.bin
   cirdb_yaml: /cirdb/cir_db.yaml
   ue_config:
-  - antennas: 2x2
-    model_id: 0
-    ds_ns: 1.0
-    speed_mps: 1.5
+@UE_CONFIG@
   timescale: 1.0
-  num_ues: 1
+  num_ues: @UE_COUNT@
   chanmod: 0
   cirdb: 0
   connection_descriptor: /tmp/oai-vla-vrtsim
