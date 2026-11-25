@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
 
-from common import RUNTIME, UE_DEVICE, command, lock, output, render, terminals, write_file
+from common import RADIO_PRESETS, RUNTIME, UE_DEVICE, command, lock, output, render, terminals, write_file
 from network import sudo_required, verify_ran
 
 # Kernel tunnel modules can create down fallback devices in every new netns.
@@ -68,7 +68,14 @@ def run(site, component, profile):
     base = Path("/run") / ("wvla-" + site["project"])
     base.mkdir(mode=0o700, exist_ok=True)
     sock = base / "iq.sock"
+    core_ready = base / "ngap-ready"
     ues = terminals(site)
+    prbs, ports, ssb, min_rx_tx = RADIO_PRESETS[site["radio_preset"]]
+    center_hz = 3_000_000_000 + (ssb - 600_000) * 15_000
+    # Type-1 RIV for the full BWP starting at RB 0 on a 275-RB reference grid.
+    bwp = 275 * (prbs - 1) if prbs <= 138 else 275 * (276 - prbs) + 274
+    # For 273 PRBs OAI's native rate is 122.88 MS/s; -E would increase it.
+    sampling = [] if prbs == 273 else ["-E"]
     run_dir = RUNTIME / "ran/logs"
     run_dir.mkdir(parents=True, exist_ok=True)
     logs = Path(mkdtemp(prefix=f"{datetime.now():%Y%m%d-%H%M%S}-{component}-", dir=run_dir))
@@ -82,12 +89,17 @@ def run(site, component, profile):
                     raise ValueError(f"{modem} already runs on this host")
         children = []
         if gnb:
-            slot_config = "  - antennas: 2x2\n    model_id: 0\n    ds_ns: 1.0\n    speed_mps: 1.5"
+            core_ready.unlink(missing_ok=True)
+            slot_config = f"  - antennas: {ports}x{ports}\n    model_id: 0\n    ds_ns: 1.0\n    speed_mps: 1.5"
             config = render("ran/gnb.yaml.in", {"AMF_IP": site["addresses"]["AMF"],
                                               "RAN_BIND_IP": site["ran_bind"], "UE_COUNT": str(len(ues)),
-                                              "UE_CONFIG": "\n".join(slot_config for _ in ues)})
+                                              "UE_CONFIG": "\n".join(slot_config for _ in ues),
+                                              "PORTS": str(ports), "PRBS": str(prbs), "BWP": str(bwp),
+                                              "SSB": str(ssb), "POINT_A": str(ssb - 12 * prbs),
+                                              "RX_TX_TIME": str(min_rx_tx),
+                                              "SLOT_AHEAD": "8" if prbs == 273 else "6"})
             if profile == "ul32":
-                mask = ",".join(map(str, range(32, 98)))
+                mask = ",".join(map(str, range(32, prbs - 8)))
                 config = re.sub(r"(?m)^(- gNB_ID:.*)$", rf'\1\n  ul_prbblacklist: "{mask}"', config)
             if profile == "dl4":
                 config = config.replace("MACRLCs:\n- tr_s_preference: local_L1",
@@ -98,7 +110,7 @@ def run(site, component, profile):
                 sock.unlink()
             if sock.exists() or sock.is_symlink():
                 raise ValueError(f"VRTSIM socket path is occupied: {sock}")
-            child = start([build / "nr-softmodem", "-O", conf, "-E", "--device.name", "vrtsim",
+            child = start([build / "nr-softmodem", "-O", conf, *sampling, "--device.name", "vrtsim",
                            "--vrtsim.role", "server", "--vrtsim.timescale", "1.0", "--vrtsim.num_ues", str(len(ues)),
                            "--vrtsim.chanmod", "0", "--vrtsim.cirdb", "0",
                            "--vrtsim.connection_descriptor", sock], logs, build, "gnb.log")
@@ -108,9 +120,17 @@ def run(site, component, profile):
 
         check_until(sock.is_socket, 45, "VRTSIM IPC did not become ready; check gnb.log", children)
         if gnb:
-            print("gNB VRTSIM socket is ready.", flush=True)
+            gnb_log = logs / "gnb.log"
+            check_until(lambda: b"Received NGSetupResponse from AMF" in gnb_log.read_bytes(),
+                        75, "gNB did not complete NG setup with the AMF; check gnb.log", children)
+            write_file(core_ready, str(sock.stat().st_ino))
+            stack.callback(core_ready.unlink, missing_ok=True)
+            print("gNB VRTSIM and AMF association are ready.", flush=True)
 
         if ue:
+            if not gnb:
+                check_until(lambda: core_ready.is_file() and core_ready.read_text() == str(sock.stat().st_ino),
+                            75, "the gNB has not reported a ready AMF association")
             names = {line.split()[0] for line in output("ip", "netns", "list").splitlines()}
             for terminal in ues:
                 ns = terminal["namespace"]
@@ -125,16 +145,16 @@ def run(site, component, profile):
                 conf = ue_logs / "ue.yaml"
                 write_file(conf, render("ran/ue.yaml.in", terminal | {"SLOT": str(terminal["slot"])}))
                 child = start(["ip", "netns", "exec", ns, build / "nr-uesoftmodem", "-O", conf,
-                               "-E", "-r", "106", "--numerology", "1", "--band", "78", "-C", "3319680000",
+                               *sampling, "-r", str(prbs), "--numerology", "1", "--band", "78", "-C", str(center_hz),
+                               "--ssb", str(6 * prbs - 120),
                                "--device.name", "vrtsim", "--vrtsim.role", "client", "--vrtsim.ue_id", str(terminal["slot"]),
                                "--vrtsim.connection_descriptor", sock, "--vrtsim.chanmod", "0",
-                               "--vrtsim.cirdb", "0", "--ue-nb-ant-rx", "2", "--ue-nb-ant-tx", "2"],
+                               "--vrtsim.cirdb", "0", "--ue-nb-ant-rx", ports, "--ue-nb-ant-tx", ports],
                               ue_logs, build, "ue.log")
                 children.append(child)
                 stack.callback(stop, child)
-            for terminal in ues:
-                ns = terminal["namespace"]
-                check_until(lambda: ue_ready(ns), 90, "PDU session did not obtain an IPv4 address; check ue.log", children)
+                # Complete random access before the next modem starts on this cell.
+                check_until(lambda: ue_ready(ns), 90, f"{ns} did not obtain a PDU address; see {ue_logs}/ue.log", children)
                 command("ip", "-n", ns, "link", "set", UE_DEVICE, "mtu", "1300")
                 for key in ("POLICY", "DN"):
                     command("ip", "-n", ns, "route", "replace", f"{site['addresses'][key]}/32", "dev", UE_DEVICE)

@@ -50,7 +50,7 @@ def ensure_path(site, key):
 def probe(site, throughput=False):
     host = ensure_path(site, "POLICY")
     http = ["curl", "--noproxy", "*", "--silent", "--show-error", "--fail",
-            "--connect-timeout", "4", "--max-time", "8"]
+            "--connect-timeout", "4", "--max-time", "8", "--retry", "2", "--retry-delay", "1"]
     command(*namespace_command(site, [*http, f"http://{host}:{POLICY_PORT}/healthz"]))
     print(f"Policy health check passed via {UE_DEVICE}.", flush=True)
     if throughput:
@@ -107,7 +107,8 @@ def run(site, args):
         {"suite": suite, "task": task, "seed": args.seed, "init_state": args.init_state,
          "replan_steps": args.replan_steps, "transport": "direct" if args.host else "ue",
          "ue": args.ue if before else None, "clock": args.clock, "renderer": site["mujoco_gl"],
-         "tun": before, "max_control_steps": args.max_control_steps},
+         "tun": before, "max_control_steps": args.max_control_steps,
+         "radio_preset": None if args.host else site["radio_preset"]},
         indent=2) + "\n")
     env["LIBERO_INIT_INDEX"] = str(args.init_state)
     env["VLA_ARM_ID"] = str(args.ue)
@@ -161,7 +162,23 @@ def multi(site, site_path, args):
     start_ns = None
     with ExitStack() as stack:
         try:
-            for number, task in enumerate(tasks, 1):
+            deadline = time.monotonic() + args.timeout
+            while True:
+                if any(p.poll() is not None for p in children) or time.monotonic() >= deadline:
+                    print(f"An arm failed to initialize. See {group}/ue-*.log", flush=True)
+                    break
+                ready = sum((group / f"ready-{i}").is_file() for i in range(1, len(children) + 1))
+                if ready == len(tasks):
+                    start_ns = time.monotonic_ns() + 500_000_000
+                    write_file(group / "start.ns", str(start_ns))
+                    for child in children:
+                        child.wait()
+                    break
+                if len(children) == len(tasks) or len(children) - ready >= args.init_parallelism:
+                    time.sleep(0.05)
+                    continue
+                number = len(children) + 1
+                task = tasks[number - 1]
                 cmd = [ROOT / "bin/lab", "--site", site_path, "sim", "run", task, "--ue", str(number),
                        "--clock", "realtime", "--output", group / f"ue-{number}"]
                 for key in ("seed", "init_state", "replan_steps", "timeout", "suite", "task", "max_control_steps"):
@@ -171,17 +188,6 @@ def multi(site, site_path, args):
                 log = stack.enter_context((group / f"ue-{number}.log").open("w"))
                 children.append(subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
                                 env=os.environ | {"VLA_ARM_GROUP": str(group)}, start_new_session=True))
-            deadline = time.monotonic() + args.timeout
-            while not all((group / f"ready-{i}").is_file() for i in range(1, len(ues) + 1)):
-                if any(p.poll() is not None for p in children) or time.monotonic() >= deadline:
-                    print(f"An arm failed to initialize. See {group}/ue-*.log", flush=True)
-                    break
-                time.sleep(0.05)
-            else:
-                start_ns = time.monotonic_ns() + 500_000_000
-                write_file(group / "start.ns", str(start_ns))
-                for child in children:
-                    child.wait()
         finally:
             for p in children:
                 if p.poll() is None:
@@ -191,7 +197,7 @@ def multi(site, site_path, args):
                         pass
             for p in children:
                 p.wait()
-    codes = [p.returncode for p in children]
+    codes = [p.returncode for p in children] + [None] * (len(tasks) - len(children))
     arms = []
     starts, ends = [], []
     for i, (task, path, code) in enumerate(zip(tasks, paths, codes), 1):
@@ -208,8 +214,11 @@ def multi(site, site_path, args):
                 starts.append(arm["timing"]["first_step_ns"])
                 ends.append(arm["timing"]["last_step_end_ns"])
         arms.append(arm)
-        print(f"UE {i} ({arm['ip']}), {task}: exit {code}", flush=True)
+        outcome = "not started" if code is None else f"exit {code}"
+        print(f"UE {i} ({arm['ip']}), {task}: {outcome}", flush=True)
     overlap = max(0, min(ends) - max(starts)) / 1e9 if len(starts) == len(arms) else None
-    write_file(group / "summary.json", json.dumps({"start_ns": start_ns,
-               "all_arms_overlap_s": overlap, "arms": arms}, indent=2))
-    return max((c if c >= 0 else 1 for c in codes), default=1)
+    write_file(group / "summary.json", json.dumps({"start_ns": start_ns, "radio_preset": site["radio_preset"],
+               "init_parallelism": args.init_parallelism, "all_arms_overlap_s": overlap, "arms": arms}, indent=2))
+    if start_ns is None or any(code not in (0, 2) for code in codes):
+        return 1
+    return max(codes)

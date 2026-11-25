@@ -65,6 +65,7 @@ def prepare_ran(jobs):
         env = os.environ | {"CC": os.environ.get("CC", "gcc-12"),
                             "CXX": os.environ.get("CXX", "g++-12")}
         cmake_flags = [
+            f"-DCMAKE_PROJECT_OpenAirInterface_INCLUDE={ROOT / 'ran/vrtsim.cmake'}",
             "-DCMAKE_BUILD_TYPE=RelWithDebInfo", "-DE2_AGENT=OFF", "-DENABLE_TESTS=OFF",
             "-DOAI_VRTSIM=ON", "-DOAI_SIMU=ON", "-DOAI_USRP=OFF", "-DOAI_VRTSIM_TAPS_CLIENT=OFF",
             "-DAVX512=OFF", "-DAUTO_DOWNLOAD_ASN1C=OFF", "-DENABLE_TELNETSRV=OFF",

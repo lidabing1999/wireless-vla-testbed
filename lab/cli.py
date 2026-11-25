@@ -16,7 +16,7 @@ import install
 import network
 import radio
 import simulation
-from common import DEFAULTS, MAX_UES, ROOT, SITE_DEFAULT, command, extend_ues, load_site, lock, terminals, write_file
+from common import DEFAULTS, MAX_UES, RADIO_PRESETS, ROOT, SITE_DEFAULT, command, extend_ues, load_site, lock, terminals, write_file
 
 HOST_ROLES = ("core", "edge", "ran", "sim")
 
@@ -49,8 +49,10 @@ def arguments():
     init.add_argument("--policy-host-port", type=bounded(1024, 65535), default=8000)
     init.add_argument("--mujoco-gl", choices=("egl", "osmesa"))
     init.add_argument("--ue-count", type=bounded(1, MAX_UES), default=1)
+    init.add_argument("--radio-preset", choices=RADIO_PRESETS, default=DEFAULTS["radio_preset"])
     expand = actions.add_parser("ues", help="extend the UE roster in an existing private site file")
     expand.add_argument("count", type=bounded(1, MAX_UES))
+    expand.add_argument("--radio-preset", choices=RADIO_PRESETS)
     actions.add_parser("subscribers", help="apply the site subscriptions to the running core database")
     actions.add_parser("plan", help="show addresses and names without credentials")
     deployment = actions.add_parser("deploy", help="install, build and start from a clean Ubuntu host")
@@ -94,6 +96,8 @@ def arguments():
     episode.add_argument("--clock", choices=("blocking", "realtime"), default="blocking")
     multi = sim_actions.add_parser("multi", help="run one 20 Hz LIBERO environment per UE")
     multi.add_argument("presets", nargs="*", metavar="TASK", help="one shared task or one task per UE")
+    multi.add_argument("--init-parallelism", type=bounded(1, MAX_UES), default=2,
+                       help="maximum simultaneous environment initializations before the shared start")
     for target in (multi, episode):
         episode_options(target)
     episode.add_argument("--host", help="use a direct control path for comparison")
@@ -197,6 +201,8 @@ def main():
         with lock(site_path.with_suffix(".lock")):
             data = json.loads(site_path.read_text())
             extend_ues(data, args.count)
+            if args.radio_preset:
+                data["radio_preset"] = args.radio_preset
             write_file(site_path, json.dumps(data, indent=2) + "\n")
         print(f"Site configured for {args.count} UEs. Copy this private file to the other host.")
         return

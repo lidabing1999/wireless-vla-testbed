@@ -1,4 +1,5 @@
 """Install and start the selected components, using the same per-role entry points."""
+import json
 import os
 import subprocess
 import time
@@ -8,6 +9,15 @@ import host
 import install
 import simulation
 from common import ROOT, RUNTIME, UE_DEVICE, command, lock, status, sudo, terminals
+
+
+def policy_route_ready(namespace, destination):
+    # Match the lookup made by the application. Forcing oif can succeed before
+    # the supervisor has installed the policy host route in the last namespace.
+    result = subprocess.run(sudo(["ip", "-n", namespace, "-j", "-4", "route", "get", destination]),
+                            capture_output=True, text=True)
+    return result.returncode == 0 and any(row.get("dev") == UE_DEVICE and row.get("prefsrc")
+                                         for row in json.loads(result.stdout))
 
 
 def systemd_radio(action, site, site_path=None, timeout=120):
@@ -21,10 +31,17 @@ def systemd_radio(action, site, site_path=None, timeout=120):
         command(*sudo(["systemd-run", f"--unit={unit}", "--collect", "--service-type=exec",
                        "--property=KillMode=mixed", "--property=TimeoutStopSec=20s",
                        "--", ROOT / "bin/lab", "--site", site_path, "radio", "both"]))
+
+    def invocation():
+        return subprocess.run(["systemctl", "show", "-p", "InvocationID", "--value", unit],
+                              capture_output=True, text=True).stdout.strip()
+
+    started = invocation()
     deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline and status("systemctl", "is-active", "--quiet", unit) == 0:
-        if all(status(*sudo(["ip", "-n", ue["namespace"], "route", "get",
-                             site["addresses"]["POLICY"], "oif", UE_DEVICE])) == 0 for ue in terminals(site)):
+    while started and time.monotonic() < deadline and invocation() == started:
+        if status("systemctl", "is-active", "--quiet", unit):
+            break
+        if all(policy_route_ready(ue["namespace"], site["addresses"]["POLICY"]) for ue in terminals(site)):
             print(f"Radio service ready: {unit}", flush=True)
             return
         time.sleep(2)

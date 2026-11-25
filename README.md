@@ -127,7 +127,27 @@ gNB 和 UE 是 Linux 原生进程。仿真客户端使用 Python 虚拟环境，
 | `ue-N/<回合>/control.jsonl` 与 `trace.jsonl` | 每步的计划/实际时刻、动作来源、请求编号、观测采集完成时刻及推理返回时刻，单位为本机单调时钟纳秒 |
 | `ue-N/<回合>/user-plane.json`、任务 JSON 与 MP4 | 每个 TUN 的起止计数器、LIBERO 目标判定与回放 |
 
-单臂退出码 `0` 表示任务成功，`2` 表示回合正常结束但未达成目标。已有端到端实测规模为 2 UE / 2 臂。固定 OAI 版本允许配置最多 16 个 UE 槽位，更大规模的实际容量取决于主机和负载。
+单臂退出码 `0` 表示任务成功，`2` 表示回合正常结束但未达成目标。已有端到端实测规模为 8 UE / 8 臂。固定 OAI 版本可配置最多 16 个 UE 槽位。`sim multi` 默认最多同时初始化两个环境，全部就绪后同步执行。通过 `--init-parallelism` 可调整初始化并行度。
+
+### 八臂与载波带宽
+
+在保存私有站点文件的一端扩容，再按上面的步骤同步订阅、重新启动 RAN。已有安装升级到此版本时，在 RAN 主机执行一次 `./bin/lab prepare ran`，使 VRTSIM 的多 UE 上行 IQ 累加使用更新的编译选项。
+
+```bash
+./bin/lab ues 8 --radio-preset siso20
+# 同步站点并启动 RAN 后，在仿真主机运行
+./bin/lab sim multi bowl --seed 7 --init-state 0 --max-control-steps 1100
+```
+
+| 站点参数 | n78 载波 | PRB | 天线 |
+| --- | --- | ---: | --- |
+| `mimo40` | 40 MHz | 106 | 2×2，原站点默认值 |
+| `siso20` | 20 MHz | 51 | 1×1 |
+| `siso100` | 100 MHz | 273 | 1×1 |
+
+三个配置均使用 30 kHz 子载波间隔，VRTSIM 时钟倍率为 1。带宽是小区上下行载波配置，八个 UE 共享该载波。切换带宽可在两端已有相同订阅的站点执行 `./bin/lab ues 8 --radio-preset siso100`，然后在 RAN 端执行 `down ran` 和 `up ran`。回合目录的 `condition.json` 记录所选配置。
+
+在 Ryzen 9 9950X 承载 RAN 与仿真、另一台 L40S 主机承载推理的站点，20 MHz 已验证 8 UE / 8 臂，100 MHz 已验证 4 UE / 4 臂。100 MHz 八槽实验中曾建立 8 个 PDU 会话，随后部分 UE 的应用请求超时，未得到八臂共同步进的有效回合。
 
 ## 运行实验
 
@@ -152,7 +172,7 @@ gNB 和 UE 是 Linux 原生进程。仿真客户端使用 Python 虚拟环境，
 
 每个回合目录包含 `condition.json`、任务结果 JSON、录像、关键帧和 `trace.jsonl`。默认使用初始状态 0、种子 7，每次执行返回动作序列的前 5 步。`sim run` 默认沿用阻塞模式，等待推理期间仿真停步。单臂和直连对照可显式传入 `--clock realtime`，使用与 `sim multi` 相同的时钟和等待动作。
 
-前台 gNB 支持 `--profile full`、`--profile ul32`、`--profile dl4`。基线载波配置为 106 PRB。`ul32` 保留连续上行 PRB 0–31 和上侧 PRB 98–105，`dl4` 将 gNB 下行 MCS 上限设为 4。切换档位需要重新启动 gNB 和 UE。
+前台 gNB 支持 `--profile full`、`--profile ul32`、`--profile dl4`。`ul32` 保留连续上行 PRB 0–31 和载波最上侧的 8 个 PRB，`dl4` 将 gNB 下行 MCS 上限设为 4。切换档位需要重新启动 gNB 和 UE。
 
 ## 版本与缓存
 

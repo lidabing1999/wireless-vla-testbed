@@ -9,17 +9,31 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "lab"), str(ROOT / "sim")]
 from common import DEFAULTS, extend_ues, load_site, terminals
+from deploy import policy_route_ready
 from realtime import RealtimeControl
 
 
 class MultiUETest(unittest.TestCase):
+    def test_readiness_uses_the_application_route(self):
+        with patch("deploy.sudo", side_effect=lambda args: args), patch("deploy.subprocess.run") as run:
+            run.return_value = Mock(returncode=2, stdout="")
+            self.assertFalse(policy_route_ready("arm-8", "192.0.2.12"))
+            self.assertNotIn("oif", run.call_args.args[0])
+            run.return_value = Mock(returncode=0, stdout='[{"dev":"eth0","prefsrc":"192.0.2.9"}]')
+            self.assertFalse(policy_route_ready("arm-8", "192.0.2.12"))
+            run.return_value = Mock(returncode=0, stdout='[{"dev":"oaitun_ue1","prefsrc":"10.0.0.9"}]')
+            self.assertTrue(policy_route_ready("arm-8", "192.0.2.12"))
+
     def test_extend_legacy_site_without_rotating_credentials(self):
         data = DEFAULTS | dict(imsi="001010000000001", k="ab" * 16, opc="cd" * 16,
                                db_password="a" * 16, db_root_password="b" * 16)
+        data.pop("radio_preset")  # existing sites predate configurable carrier bandwidth
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "site.json"
             path.write_text(json.dumps(data))
-            original = terminals(load_site(path))
+            legacy = load_site(path)
+            self.assertEqual(legacy["radio_preset"], "mimo40")
+            original = terminals(legacy)
             extend_ues(data, 2)
             saved = copy.deepcopy(data)
             extend_ues(data, 2)

@@ -17,6 +17,9 @@ SITE_DEFAULT = ROOT / "local/site.json"
 UE_DEVICE = "oaitun_ue1"
 MAX_UES = 16  # MAX_MOBILES_PER_GNB in the pinned OAI build
 POLICY_PORT = 8000
+# PRBs at 30 kHz, antenna ports, SSB NR-ARFCN and minimum RX-to-TX slots.
+RADIO_PRESETS = {"mimo40": (106, 2, 621312, 6), "siso20": (51, 1, 623424, 8),
+                 "siso100": (273, 1, 623424, 8)}
 DEFAULTS = json.loads((ROOT / "config/site.example.json").read_text())
 OFFSETS = {"NRF": 2, "MYSQL": 3, "AMF": 4, "SMF": 5, "UPF": 6, "DN": 7,
            "UDR": 8, "UDM": 9, "AUSF": 10, "IMS_SLOT": 11, "POLICY": 12}
@@ -38,6 +41,8 @@ def load_site(path):
     if missing or unknown:
         raise ValueError(f"site fields missing {sorted(missing)} or unknown {sorted(unknown)}")
     site = DEFAULTS | site | {"topology": topology}
+    if site["radio_preset"] not in RADIO_PRESETS:
+        raise ValueError(f"choose radio_preset from {list(RADIO_PRESETS)}")
     underlay = [ipaddress.IPv4Address(site[k]) for k in ("ran_ip", "edge_ip")] if topology == "dual" else []
     tunnel = ipaddress.IPv4Network(site["tunnel_subnet"])
     bridge = ipaddress.IPv4Network(site["bridge_subnet"])

@@ -10,5 +10,6 @@
   "ue_namespace": "vla-ue",
   "gpu": "0",
   "policy_host_port": 8000,
-  "mujoco_gl": "egl"
+  "mujoco_gl": "egl",
+  "radio_preset": "mimo40"
 }
