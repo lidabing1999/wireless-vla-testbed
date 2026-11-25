@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: LicenseRef-CSSL-1.0
+-- Modified for this testbed: subscriber data is provisioned separately at deployment.
 -- phpMyAdmin SQL Dump
 -- version 5.1.0
 -- https://www.phpmyadmin.net/

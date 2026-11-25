@@ -1,4 +1,5 @@
 -- SPDX-License-Identifier: LicenseRef-CSSL-1.0
+-- Modified for this testbed: subscriber identities and keys are supplied by the local site configuration.
 INSERT INTO `AuthenticationSubscription` (`ueid`, `authenticationMethod`, `encPermanentKey`, `protectionParameterId`, `sequenceNumber`, `authenticationManagementField`, `algorithmId`, `encOpcKey`, `encTopcKey`, `vectorGenerationInHss`, `n5gcAuthMethod`, `rgAuthenticationInd`, `supi`) VALUES
     ('@IMSI@', '5G_AKA', '@K@', '@K@', '{\"sqn\": \"000000000000\", \"sqnScheme\": \"NON_TIME_BASED\", \"lastIndexes\": {\"ausf\": 0}}', '8000', 'milenage', '@OPC@', NULL, NULL, NULL, NULL, '@IMSI@');
 

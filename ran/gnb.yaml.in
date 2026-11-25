@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-CSSL-1.0
+# Modified for this testbed: parameterized the AMF and gNB addresses for VRTSIM.
 Active_gNBs:
 - gnb-rfsim
 Asn1_verbosity: none

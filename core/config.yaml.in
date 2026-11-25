@@ -1,4 +1,5 @@
 # SPDX-License-Identifier: LicenseRef-CSSL-1.0
+# Modified for this testbed: render the database password and site-specific addresses at deployment.
 
 # OAI CN Configuration File
 ### This file can be used by all OAI NFs
