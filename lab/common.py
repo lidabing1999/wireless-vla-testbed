@@ -12,7 +12,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / ".state"
-SOURCES = json.loads((ROOT / "config/sources.json").read_text())
 SITE_DEFAULT = ROOT / "local/site.json"
 UE_DEVICE = "oaitun_ue1"
 POLICY_PORT = 8000
@@ -26,24 +25,30 @@ def load_site(path):
     if not isinstance(site, dict):
         raise ValueError("site configuration must be a JSON object")
     secrets = ("imsi", "k", "opc", "db_password", "db_root_password")
-    required = {"ran_ip", "edge_ip", *secrets}
+    topology = site.get("topology", DEFAULTS["topology"])
+    if topology not in ("single", "dual"):
+        raise ValueError("topology must be single or dual")
+    required = set(secrets)
+    if topology == "dual":
+        required.update(("ran_ip", "edge_ip"))
     missing = required - site.keys()
     unknown = site.keys() - DEFAULTS.keys() - required
     if missing or unknown:
         raise ValueError(f"site fields missing {sorted(missing)} or unknown {sorted(unknown)}")
-    site = DEFAULTS | site
-    underlay = [ipaddress.IPv4Address(site[key]) for key in ("ran_ip", "edge_ip")]
+    site = DEFAULTS | site | {"topology": topology}
+    underlay = [ipaddress.IPv4Address(site[k]) for k in ("ran_ip", "edge_ip")] if topology == "dual" else []
     tunnel = ipaddress.IPv4Network(site["tunnel_subnet"])
     bridge = ipaddress.IPv4Network(site["bridge_subnet"])
     ue_pool = ipaddress.IPv4Network("10.0.0.0/16")
-    if underlay[0] == underlay[1] or any(
+    if underlay and (underlay[0] == underlay[1] or any(
         ip.is_unspecified or ip.is_loopback or ip.is_multicast for ip in underlay
-    ):
+    )):
         raise ValueError("ran_ip and edge_ip must be distinct, routable underlay IPv4 addresses")
     if tunnel.prefixlen != 30 or not 16 <= bridge.prefixlen <= 28:
         raise ValueError("use a /30 for tunnel_subnet and a /16 through /28 for bridge_subnet")
-    if (tunnel.overlaps(bridge) or tunnel.overlaps(ue_pool) or bridge.overlaps(ue_pool)
-            or any(ip in tunnel or ip in bridge or ip in ue_pool for ip in underlay)):
+    if bridge.overlaps(ue_pool) or (topology == "dual" and (
+            tunnel.overlaps(bridge) or tunnel.overlaps(ue_pool)
+            or any(ip in tunnel or ip in bridge or ip in ue_pool for ip in underlay))):
         raise ValueError("underlay, tunnel, Docker bridge, and UE address ranges must be disjoint")
     for key in ("bridge", "tunnel", "ue_namespace"):
         if not re.fullmatch(r"[a-z][a-z0-9-]{0,14}", site[key]):
@@ -64,9 +69,16 @@ def load_site(path):
                          ("db_root_password", r"[A-Za-z0-9_-]{16,128}")):
         if not re.fullmatch(pattern, site[key]):
             raise ValueError(f"invalid format for {key}")
-    site["ran_ip"], site["edge_ip"] = map(str, underlay)
-    site["ran_tunnel"] = str(tunnel.network_address + 2)
-    site["core_tunnel"] = str(tunnel.network_address + 1)
+    site["bridge_gateway"] = str(bridge.network_address + 1)
+    if topology == "dual":
+        site["ran_ip"], site["edge_ip"] = map(str, underlay)
+        site["ran_tunnel"] = str(tunnel.network_address + 2)
+        site["core_tunnel"] = str(tunnel.network_address + 1)
+        site["ran_bind"] = site["ran_tunnel"]
+    else:
+        for key in ("ran_ip", "edge_ip", "tunnel", "tunnel_subnet"):
+            site.pop(key)
+        site["ran_bind"] = site["bridge_gateway"]
     site["addresses"] = {key: str(bridge.network_address + offset)
                          for key, offset in OFFSETS.items()}
     return site
@@ -148,30 +160,62 @@ def unpack_source(name, entry, checkout, stage):
     (checkout / ".archive-commit").write_text(commit + "\n")
 
 
+def source_path(name):
+    cached = RUNTIME / "src" / name
+    submodule = ROOT / "vendor" / name
+    if (cached / ".archive-commit").is_file() or not (submodule / ".git").exists():
+        return cached
+    return submodule
+
+
 def fetch(name):
-    entry = SOURCES[name]
-    dest = RUNTIME / "src" / name
-    dest.parent.mkdir(parents=True, exist_ok=True)
+    submodule = ROOT / "vendor" / name
+    archive_supported = name in ("openpi", "libero", "lerobot")
     with lock(RUNTIME / "locks" / f"source-{name}"):
-        if not dest.exists():
-            print(f"Fetching {name} at {entry['commit'][:12]}", flush=True)
-            with tempfile.TemporaryDirectory(prefix=f"{name}-", dir=dest.parent) as stage:
-                checkout = Path(stage) / name
-                if name in ("openpi", "libero", "lerobot"):
-                    unpack_source(name, entry, checkout, Path(stage))
-                else:
-                    env = os.environ | {"GIT_LFS_SKIP_SMUDGE": "1", "GIT_TERMINAL_PROMPT": "0"}
-                    command("git", "init", "--quiet", checkout)
-                    command("git", "-C", checkout, "remote", "add", "origin", entry["url"])
-                    command("git", "-C", checkout, "fetch", "--depth=1", "origin", entry["commit"], env=env)
-                    command("git", "-C", checkout, "checkout", "--quiet", "--detach", "FETCH_HEAD", env=env)
-                checkout.rename(dest)
+        entry = output("git", "-C", ROOT, "ls-files", "--stage", "--", submodule).split()
+        if not entry or entry[0] != "160000":
+            raise ValueError(f"missing Git submodule entry: {submodule}")
+        commit = entry[1]
+        dest = source_path(name)
         archive_commit = dest / ".archive-commit"
         if archive_commit.is_file():
-            head, dirty = archive_commit.read_text().strip(), False
+            if archive_commit.read_text().strip() != commit:
+                raise ValueError(f"cached {name} does not match {commit}; move aside {dest} and retry")
+            return dest
+        if (dest / ".git").exists():
+            dirty = output("git", "-C", dest, "status", "--porcelain", "-uno", "--ignore-submodules=all")
+            if dirty:
+                raise ValueError(f"save changes in {dest} before preparing {name}")
+            if output("git", "-C", dest, "rev-parse", "HEAD") == commit:
+                return dest
+            if dest != submodule:
+                raise ValueError(f"cached {name} does not match {commit}; move aside {dest} and retry")
+
+        url = output("git", "config", "--file", ROOT / ".gitmodules", "--get", f"submodule.{name}.url")
+        if archive_supported:
+            skip_git = os.environ.get("VLA_SOURCE_ARCHIVES") or status(
+                "curl", "-fsS", "--connect-timeout", "8", "--max-time", "15", "-o", "/dev/null",
+                f"{url}/info/refs?service=git-upload-pack")
         else:
-            head = output("git", "-C", dest, "rev-parse", "HEAD")
-            dirty = bool(output("git", "-C", dest, "status", "--porcelain", "-uno"))
-        if head != entry["commit"] or dirty:
-            raise ValueError(f"expected clean {name} at {entry['commit']} under {dest}")
-    return dest
+            skip_git = False
+        if not skip_git:
+            env = os.environ | {"GIT_LFS_SKIP_SMUDGE": "1", "GIT_TERMINAL_PROMPT": "0"}
+            try:
+                command("git", "-C", ROOT, "-c", "http.lowSpeedLimit=1024", "-c", "http.lowSpeedTime=30",
+                        "submodule", "update", "--init", "--checkout", "--depth", "1", "--", submodule, env=env)
+            except subprocess.CalledProcessError:
+                if not archive_supported:
+                    raise
+            else:
+                if output("git", "-C", submodule, "rev-parse", "HEAD") != commit:
+                    raise ValueError(f"expected {name} at {commit} under {submodule}")
+                return submodule
+
+        dest = RUNTIME / "src" / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        print(f"Fetching the pinned {name} archive at {commit[:12]}", flush=True)
+        with tempfile.TemporaryDirectory(prefix=f"{name}-", dir=dest.parent) as stage:
+            checkout = Path(stage) / name
+            unpack_source(name, {"commit": commit, "url": url}, checkout, Path(stage))
+            checkout.rename(dest)
+        return dest

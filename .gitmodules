@@ -1,0 +1,24 @@
+[submodule "oai"]
+	path = vendor/oai
+	url = https://github.com/duranta-project/openairinterface5g.git
+	shallow = true
+[submodule "simde"]
+	path = vendor/simde
+	url = https://github.com/simd-everywhere/simde-no-tests.git
+	shallow = true
+[submodule "openpi"]
+	path = vendor/openpi
+	url = https://github.com/Physical-Intelligence/openpi.git
+	shallow = true
+[submodule "libero"]
+	path = vendor/libero
+	url = https://github.com/Lifelong-Robot-Learning/LIBERO.git
+	shallow = true
+[submodule "lerobot"]
+	path = vendor/lerobot
+	url = https://github.com/huggingface/lerobot.git
+	shallow = true
+[submodule "asn1c"]
+	path = vendor/asn1c
+	url = https://github.com/mouse07410/asn1c.git
+	shallow = true

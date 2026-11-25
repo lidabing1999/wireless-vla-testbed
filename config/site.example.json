@@ -1,4 +1,5 @@
 {
+  "topology": "dual",
   "ran_ip": "192.0.2.10",
   "edge_ip": "192.0.2.20",
   "tunnel_subnet": "172.31.250.0/30",

@@ -10,8 +10,12 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
 
-from common import RUNTIME, UE_DEVICE, command, lock, output, render, status, subscriber_values, write_file
+from common import RUNTIME, UE_DEVICE, command, lock, output, render, subscriber_values, write_file
 from network import sudo_required, verify_ran
+
+# Kernel tunnel modules can create down fallback devices in every new netns.
+FALLBACK_TUNNELS = {"tunl0": "ipip", "sit0": "sit", "gre0": "gre", "gretap0": "gretap",
+                    "erspan0": "erspan", "ip6tnl0": "ip6tnl", "ip6gre0": "ip6gre"}
 
 
 def check_until(condition, seconds, message, children=()):
@@ -47,7 +51,8 @@ def stop(child):
 
 
 def already_running(modem):
-    return status("pgrep", "-x", modem) == 0
+    processes = subprocess.run(["ps", "-C", modem, "-o", "stat="], capture_output=True, text=True)
+    return any(not state.startswith("Z") for state in processes.stdout.split())
 
 
 def run(site, component, profile):
@@ -78,7 +83,7 @@ def run(site, component, profile):
         children = []
         if gnb:
             config = render("ran/gnb.yaml.in", {"AMF_IP": site["addresses"]["AMF"],
-                                              "RAN_TUNNEL_IP": site["ran_tunnel"]})
+                                              "RAN_BIND_IP": site["ran_bind"]})
             if profile == "ul32":
                 mask = ",".join(map(str, range(32, 98)))
                 config = re.sub(r"(?m)^(- gNB_ID:.*)$", rf'\1\n  ul_prbblacklist: "{mask}"', config)
@@ -107,8 +112,9 @@ def run(site, component, profile):
             names = {line.split()[0] for line in output("ip", "netns", "list").splitlines()}
             if ns not in names:
                 command("ip", "netns", "add", ns)
-            if set(json_link_names(ns)) != {"lo"}:
-                raise ValueError(f"namespace {ns} already has an interface other than lo")
+                stack.callback(remove_unused_namespace, ns)
+            if has_active_or_custom_links(ns):
+                raise ValueError(f"namespace {ns} already contains another configured interface")
             command("ip", "-n", ns, "link", "set", "lo", "up")
             conf = logs / "ue.yaml"
             write_file(conf, render("ran/ue.yaml.in", subscriber_values(site)))
@@ -137,5 +143,16 @@ def ue_ready(namespace):
     return result.returncode == 0 and "inet " in result.stdout
 
 
-def json_link_names(namespace):
-    return [link["ifname"] for link in json.loads(output("ip", "-n", namespace, "-j", "link", "show"))]
+def has_active_or_custom_links(namespace):
+    links = json.loads(output("ip", "-n", namespace, "-j", "-d", "link", "show"))
+    for link in links:
+        name = link["ifname"]
+        if name != "lo" and (name not in FALLBACK_TUNNELS or "UP" in link["flags"]
+                             or link.get("linkinfo", {}).get("info_kind") != FALLBACK_TUNNELS[name]):
+            return True
+    return False
+
+
+def remove_unused_namespace(namespace):
+    if not output("ip", "netns", "pids", namespace):
+        command("ip", "netns", "delete", namespace)

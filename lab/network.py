@@ -1,6 +1,7 @@
 """Configure the N2/N3 IPIP link and the limited Docker forwarding rules."""
 import json
 import os
+import socket
 import subprocess
 from pathlib import Path
 
@@ -33,6 +34,15 @@ def iptables(chain, rule, table="filter"):
 
 def apply(role, site):
     sudo_required()
+    if site["topology"] == "single":
+        try:
+            socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_SCTP).close()
+        except OSError:
+            command("modprobe", "sctp")
+        if not Path("/dev/net/tun").is_char_device():
+            command("modprobe", "tun")
+        verify_ran(site)
+        return
     interface = site["tunnel"]
     edge = role == "core"
     here, peer = (site["edge_ip"], site["ran_ip"]) if edge else (site["ran_ip"], site["edge_ip"])
@@ -92,7 +102,10 @@ def enable_forwarding(site):
 
 
 def verify_ran(site):
+    device = site["bridge"] if site["topology"] == "single" else site["tunnel"]
     for key in ("AMF", "UPF"):
         entry = route(site["addresses"][key])
-        if entry.get("dev") != site["tunnel"] or entry.get("prefsrc") != site["ran_tunnel"]:
-            raise ValueError(f"{key} is not routed through {site['tunnel']}; run lab network ran")
+        if entry.get("dev") != device or entry.get("prefsrc") != site["ran_bind"]:
+            if site["topology"] == "single":
+                raise ValueError(f"{key} is not reachable on {device}; start the local core")
+            raise ValueError(f"{key} is not routed through {device}; run lab network ran")

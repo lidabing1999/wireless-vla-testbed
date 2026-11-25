@@ -1,4 +1,4 @@
-"""Single deployment entry point for the two-host VLA testbed."""
+"""Deploy the wireless VLA testbed on one or two Linux hosts."""
 import argparse
 import json
 import os
@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 
 import containers
+import deploy
+import host
 import install
 import network
 import radio
@@ -34,8 +36,9 @@ def arguments():
                         help="local deployment JSON (default: local/site.json)")
     actions = parser.add_subparsers(dest="action", required=True)
     init = actions.add_parser("init", help="create one site configuration with random lab credentials")
-    init.add_argument("--ran-ip", required=True)
-    init.add_argument("--edge-ip", required=True)
+    init.add_argument("--topology", choices=("single", "dual"))
+    init.add_argument("--ran-ip")
+    init.add_argument("--edge-ip")
     init.add_argument("--gpu", default=DEFAULTS["gpu"])
     init.add_argument("--bridge-subnet", default=DEFAULTS["bridge_subnet"])
     init.add_argument("--tunnel-subnet", default=DEFAULTS["tunnel_subnet"])
@@ -44,8 +47,13 @@ def arguments():
     init.add_argument("--tunnel", default=DEFAULTS["tunnel"])
     init.add_argument("--ue-namespace", default=DEFAULTS["ue_namespace"])
     init.add_argument("--policy-host-port", type=bounded(1024, 65535), default=8000)
-    init.add_argument("--mujoco-gl", choices=("egl", "osmesa"), default="egl")
+    init.add_argument("--mujoco-gl", choices=("egl", "osmesa"))
     actions.add_parser("plan", help="show addresses and names without credentials")
+    deployment = actions.add_parser("deploy", help="install, build and start from a clean Ubuntu host")
+    deployment.add_argument("role", choices=("all", *HOST_ROLES), nargs="?", default="all")
+    deployment.add_argument("--gpu", help="GPU device for a new single-host site")
+    deployment.add_argument("--jobs", type=bounded(1, 64), default=min(4, os.cpu_count() or 2))
+    deployment.add_argument("--smoke", action="store_true", help="run the bowl task through the UE")
 
     for name, help_text in (("deps", "install OS packages for Ubuntu 22.04"),
                             ("prepare", "fetch dependencies and build or pull the role"),
@@ -60,7 +68,7 @@ def arguments():
                             ("status", "list runtime container status"),
                             ("validate", "render and validate Compose configuration")):
         part = actions.add_parser(name, help=help_text)
-        part.add_argument("role", choices=("core", "edge"))
+        part.add_argument("role", choices=("core", "edge", "ran") if name in ("down", "status") else ("core", "edge"))
         if name == "up":
             part.add_argument("--timeout", type=bounded(1, 7200))
 
@@ -89,11 +97,16 @@ def arguments():
     return parser.parse_args()
 
 
-def init_site(args):
-    path = args.site
+def init_site(path, overrides):
+    path = path.expanduser()
     if path.exists():
         raise ValueError(f"{path} already exists")
-    data = {key: getattr(args, key) for key in DEFAULTS}
+    data = DEFAULTS | overrides
+    if not overrides.get("mujoco_gl"):
+        data["mujoco_gl"] = "osmesa" if data["topology"] == "single" else "egl"
+    if data["topology"] == "single":
+        for key in ("ran_ip", "edge_ip", "tunnel", "tunnel_subnet"):
+            data.pop(key, None)
     data.update({"imsi": f"00101{secrets.randbelow(10**10):010}",
                  "k": secrets.token_hex(16), "opc": secrets.token_hex(16),
                  "db_password": secrets.token_hex(20), "db_root_password": secrets.token_hex(20)})
@@ -107,7 +120,9 @@ def init_site(args):
     except (ValueError, TypeError):
         path.unlink()
         raise
-    print(f"Site configuration created at {path}. Copy this file to both hosts.")
+    print(f"Site configuration created at {path}.")
+    if data["topology"] == "dual":
+        print("Copy this file to both hosts.")
 
 
 def doctor(role):
@@ -123,7 +138,7 @@ def doctor(role):
         raise ValueError(f"missing programs: {', '.join(missing)}")
     if role in ("core", "edge"):
         command("docker", "compose", "version")
-        command("docker", "info", "--format", "{{json .Runtimes}}")
+        command(*host.docker_cli(), "info", "--format", "{{json .Runtimes}}")
     if role == "edge":
         command("nvidia-smi", "--query-gpu=index,uuid,name,memory.free", "--format=csv")
     if role == "ran" and not Path("/dev/net/tun").exists():
@@ -135,7 +150,11 @@ def main():
     args = arguments()
     action = args.action
     if action == "init":
-        init_site(args)
+        topology = args.topology or ("dual" if args.ran_ip or args.edge_ip else "single")
+        if topology == "dual" and not (args.ran_ip and args.edge_ip):
+            raise ValueError("a dual-host site requires both --ran-ip and --edge-ip")
+        values = {key: getattr(args, key) for key in DEFAULTS}
+        init_site(args.site, values | {"topology": topology})
         return
     if action == "doctor":
         doctor(args.role)
@@ -151,27 +170,38 @@ def main():
             install.prepare_sim()
         return
 
-    site = load_site(args.site.expanduser())
+    site_path = args.site.expanduser().absolute()
+    if action == "deploy" and not site_path.exists():
+        install.require_linux()
+        host.require_ubuntu()
+        init_site(site_path, {"topology": "single", "gpu": args.gpu or DEFAULTS["gpu"]})
+    site = load_site(site_path)
     if action == "plan":
-        fields = set(DEFAULTS) | {"ran_tunnel", "core_tunnel", "addresses"}
+        fields = set(DEFAULTS) | {"ran_tunnel", "core_tunnel", "addresses", "ran_bind", "bridge_gateway"}
         print(json.dumps({key: value for key, value in site.items() if key in fields}, indent=2))
         return
     install.require_linux()
+    if action == "deploy":
+        if args.gpu is not None and site["gpu"] != args.gpu:
+            raise ValueError("edit gpu in the existing site configuration to change devices")
+        return deploy.deploy(site, site_path, args.role, args.jobs, args.smoke)
     if action == "prepare":
         containers.prepare(args.role, site)
     elif action == "validate":
         containers.compose(args.role, site, "config", "--quiet")
         print(f"{args.role}: Compose configuration valid.")
     elif action == "up":
-        wait = args.timeout or (240 if args.role == "core" else 2400)
-        if args.role == "edge":
-            containers.compose("edge", site, "up", "-d", "--no-build", "--wait", "--wait-timeout", str(wait))
-        else:
-            containers.compose("core", site, "up", "-d", "--wait", "--wait-timeout", str(wait))
+        containers.up(args.role, site, args.timeout)
     elif action == "down":
-        containers.compose(args.role, site, "down")
+        if args.role == "ran":
+            deploy.systemd_radio("stop", site)
+        else:
+            containers.compose(args.role, site, "down")
     elif action == "status":
-        containers.compose(args.role, site, "ps", "-a")
+        if args.role == "ran":
+            command("systemctl", "status", f"{site['project']}-radio.service", "--no-pager")
+        else:
+            containers.compose(args.role, site, "ps", "-a")
     elif action == "network":
         network.apply(args.role, site)
     elif action == "radio":

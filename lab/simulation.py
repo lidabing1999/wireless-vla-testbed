@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
 
-from common import POLICY_PORT, ROOT, RUNTIME, UE_DEVICE, command, sudo, write_file
+from common import POLICY_PORT, ROOT, RUNTIME, UE_DEVICE, command, source_path, sudo, write_file
 
 PRESETS = {"bowl": ("libero_goal", 1), "two-objects": ("libero_10", 0), "drawer": ("libero_10", 3)}
 
@@ -41,8 +41,8 @@ def probe(site, throughput=False):
 
 def environment(site):
     python = Path(os.environ.get("VLA_SIM_ENV_PYTHON", RUNTIME / "sim/venv/bin/python"))
-    libero = RUNTIME / "src/libero"
-    client = RUNTIME / "src/openpi/packages/openpi-client/src"
+    libero = source_path("libero")
+    client = source_path("openpi") / "packages/openpi-client/src"
     if not python.is_file() or not (libero / "libero/libero/init_files").is_dir() or not client.is_dir():
         raise ValueError("prepare the simulation environment and assets first")
     path = RUNTIME / "sim/config"

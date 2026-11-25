@@ -77,4 +77,5 @@ typeguard==4.4.4
 typing_extensions==4.15.0
 tyro==0.9.22
 websockets==15.0.1
+wrapt==2.5.2
 zipp==3.23.0

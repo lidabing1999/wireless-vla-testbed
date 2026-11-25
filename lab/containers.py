@@ -1,9 +1,12 @@
 """Render runtime-only Compose inputs and manage the two service groups."""
 import hashlib
 import os
+import subprocess
+import time
 from pathlib import Path
 
 from common import ROOT, RUNTIME, command, lock, render, subscriber_values, write_file
+from host import docker_cli
 from install import stage_edge
 
 
@@ -36,17 +39,35 @@ def compose(role, site, *args, context=None):
             env |= {"EDGE_CONTEXT": str(context or RUNTIME / "edge/context"),
                     "POLICY_IMAGE": os.environ.get("VLA_POLICY_IMAGE", f"{site['project']}-openpi:pi05-215abfb"),
                     "MODEL_CACHE": str(cache), "NVIDIA_GPU": site["gpu"],
-                    "POLICY_HOST_PORT": str(site["policy_host_port"])}
-        command("docker", "compose", "--project-name", project, "--env-file", "/dev/null",
+                    "POLICY_HOST_PORT": str(site["policy_host_port"]),
+                    "POLICY_PIP_INDEX": os.environ.get("POLICY_PIP_INDEX", "https://pypi.org/simple"),
+                    "POLICY_WHEEL_ORIGIN": os.environ.get("POLICY_WHEEL_ORIGIN", "https://files.pythonhosted.org")}
+        compose_env = runtime / "compose.env"
+        rows = [key + "='" + value.replace("'", "\\'") + "'\n" for key, value in env.items()]
+        write_file(compose_env, "".join(rows))
+        command(*docker_cli(), "compose", "--project-name", project, "--env-file", compose_env,
                 "-f", ROOT / role / "compose.yaml", *args, env=os.environ | env)
 
 
 def prepare(role, site):
     if role == "core":
-        compose("core", site, "pull")
+        for attempt in range(3):
+            try:
+                compose("core", site, "pull", "--policy", "missing")
+                return
+            except subprocess.CalledProcessError:
+                if attempt == 2:
+                    raise
+                time.sleep(3 * (attempt + 1))
     else:
         if "VLA_POLICY_IMAGE" in os.environ:
-            command("docker", "image", "inspect", os.environ["VLA_POLICY_IMAGE"], "--format", "{{.Id}}")
+            command(*docker_cli(), "image", "inspect", os.environ["VLA_POLICY_IMAGE"], "--format", "{{.Id}}")
         else:
             context = stage_edge()
             compose("edge", site, "build", context=context)
+
+
+def up(role, site, timeout=None):
+    wait = timeout or (240 if role == "core" else 2400)
+    extra = ["--no-build"] if role == "edge" else []
+    compose(role, site, "up", "-d", *extra, "--wait", "--wait-timeout", str(wait))

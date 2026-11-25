@@ -1,4 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 root="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+if ! command -v python3 >/dev/null; then
+    action=${1-}
+    if [[ "$action" == "--site" ]]; then action=${3-}; fi
+    if [[ "$action" != deploy || ! -r /etc/os-release ]]; then
+        printf 'Python 3 is required. On Ubuntu use lab deploy to bootstrap it.\n' >&2
+        exit 1
+    fi
+    . /etc/os-release
+    if [[ "${ID-}:${VERSION_ID-}" != ubuntu:22.04 || "$(uname -m)" != x86_64 ]]; then
+        printf 'The automatic installer requires Ubuntu 22.04 x86_64.\n' >&2
+        exit 1
+    fi
+    admin=()
+    if [[ $EUID != 0 ]]; then admin=(sudo); fi
+    "${admin[@]}" apt-get update
+    "${admin[@]}" apt-get install -y python3
+fi
 exec python3 "$root/lab/cli.py" "$@"

@@ -1,120 +1,103 @@
-# 无线具身智能双机实验平台
+# 无线具身智能实验平台
 
-用同一个仓库部署 OAI gNB、UE、5G 核心网、OpenPI π₀.₅-LIBERO 服务和 LIBERO/MuJoCo。仓库包含部署入口、实验组网参数、依赖锁和回合采集脚本。首次部署由 `bin/lab prepare` 下载对应组件的上游版本、镜像和 Python 依赖。OpenPI 首次启动时自动下载模型权重。
+同一个 Git 仓库部署 OAI gNB、UE、5G 核心网、OpenPI π₀.₅-LIBERO 和 LIBERO/MuJoCo。OAI、ASN.1 编译器、SIMDe、OpenPI、LIBERO、LeRobot 通过 [Git submodule](.gitmodules) 固定提交。部署器初始化所需 submodule、编译程序、安装依赖并启动服务。
 
-```mermaid
-flowchart LR
-  subgraph RAN["Linux A · RAN 与仿真"]
-    S["LIBERO / MuJoCo"] --> T["UE 网络命名空间<br/>oaitun_ue1"]
-    T --> U["OAI nrUE"]
-    U <-->|VRTSIM Unix socket| G["OAI gNB"]
-  end
-  subgraph EDGE["Linux B · 核心网与 GPU"]
-    A["AMF"]
-    F["UPF"] --> P["OpenPI π₀.₅-LIBERO<br/>WebSocket 8000"]
-    F --> D["ext-dn / iperf3"]
-  end
-  G <-->|IPIP · N2 SCTP 38412| A
-  G <-->|IPIP · N3 GTP-U 2152| F
-```
+## 单机首次部署
 
-## 准备工作
+目标是带 NVIDIA GPU 的 **Ubuntu 22.04 x86_64** 主机。需要具有 sudo 权限的账号，以及访问系统软件源、GitHub、容器镜像仓库、PyPI、PyTorch 和 OpenPI 权重存储的网络。主机应支持 AVX2、Linux TUN 和 SCTP，磁盘需容纳模型缓存、容器镜像和编译产物。权重缓存约 12 GB，建议为首次构建预留至少 50 GB。已用 L40S 验证推理。
 
-- 推荐两台 Ubuntu 22.04 x86_64 服务器。Linux A 需要可用的 `/dev/net/tun`、AVX2 和 EGL 或 OSMesa。gNB 与 UE 共用同一台服务器，通过 VRTSIM 的 Unix socket 交换 IQ 数据。
-- Linux B 需要 Docker Engine、Docker Compose v2、NVIDIA 驱动和 NVIDIA Container Toolkit。验证原平台使用 L40S。运行 `nvidia-smi -L` 选择 GPU UUID，或使用设备序号。预留模型约 12 GB、镜像构建与下载缓存额外约 20 GB 的磁盘。
-- 两台服务器之间需要双向 IPv4 可达，并允许 IPIP，即 **IP 协议号 4**。主机防火墙使用 Docker 的 iptables 后端。检查站点的 Docker 网段和隧道网段与现有网络无重叠。
-- 首次准备需要访问 GitHub、容器镜像仓库、Python 装包源和 OpenPI 模型存储。跨机的 SSH 文件传输走管理网络，实验推理走 UE 用户面。
-
-## 首次部署
-
-将仓库 clone 到两台机器。可在本机 checkout 里生成一次站点文件，再复制到两台服务器相应 checkout 的 `local/site.json`。以下两个地址是示例，换成 Linux A、B 用于互通的实际地址。
+在主机 clone 此仓库后，进入仓库目录，用普通实验账号运行：
 
 ```bash
-./bin/lab init --ran-ip 192.0.2.10 --edge-ip 192.0.2.20 --gpu 0
+./bin/lab deploy --smoke
+```
+
+默认使用第一块 NVIDIA GPU。首次部署可以指定 `--gpu 1` 或 GPU UUID，并用 `--jobs 8` 调整编译并行度。
+
+首次部署会完成以下步骤。
+
+1. 准备主机依赖、Docker Engine、Docker Compose 插件 和 NVIDIA Container Toolkit。若 NVIDIA 驱动需要重启才能加载，按终端提示重启后重跑同一条命令。
+2. 拉取固定源码，在本机生成 `.state/ran/build/nr-softmodem`（gNB）和 `.state/ran/build/nr-uesoftmodem`（UE），并构建 VRTSIM 运行库。
+3. 安装 Python 3.10 仿真环境、MuJoCo、robosuite 和 OpenPI 客户端，载入 LIBERO 场景并验证离屏渲染。
+4. 启动 OAI 核心网和 GPU 推理容器。π₀.₅ 权重由 OpenPI 首次启动时下载到 `.state/edge/model-cache`。
+5. 启动 gNB 和 UE，经 `oaitun_ue1` 检查推理服务。加 `--smoke` 时继续运行一次放碗回合，并将结果、录像和分段计时写入 `runs/`。
+
+单机模式下，gNB 的 N2/N3 地址是核心网 Docker bridge 的网关，UE 和仿真共用 UE 网络命名空间。gNB 与 UE 通过本机 VRTSIM Unix socket 交换 IQ 数据。首次运行自动生成 `local/site.json`，保存联动的 UE 订阅、容器网段和 GPU 选择。设置更改后用同一站点文件重新部署。单机默认使用 OSMesa 做无头渲染，需要 EGL 时可改站点的 `mujoco_gl`。
+
+若现有网络占用了默认网段或端口，先初始化站点，再执行部署。
+
+```bash
+./bin/lab init --topology single --bridge-subnet 172.30.218.0/26 --policy-host-port 18825 --gpu 0
+./bin/lab plan
+./bin/lab deploy --smoke
+```
+
+如果部署主机需要通过内部镜像站访问 Docker Hub，可运行 `VLA_DOCKER_MIRROR=https://your-mirror.example ./bin/lab deploy --smoke`。部署器会保留其他 Docker 配置，镜像仍按原摘要匹配。 [Docker Hub 镜像源配置](https://docs.docker.com/docker-hub/image-library/mirror/)
+
+## 单独准备或启动组件
+
+| 目的 | 操作 |
+| --- | --- |
+| 只准备 gNB 和 UE 程序 | `./bin/lab deps ran`，再运行 `./bin/lab prepare ran` |
+| 只启动 gNB | 核心网就绪后运行 `sudo ./bin/lab network ran`，再运行 `sudo ./bin/lab radio gnb` |
+| 在第二个终端启动 UE | `sudo ./bin/lab radio ue` |
+| 部署核心网 | `./bin/lab deploy core` |
+| 在核心网 bridge 上部署边缘服务 | `./bin/lab deploy edge` |
+| 准备并检查仿真 | `./bin/lab deploy sim` |
+| 源码已准备且希望前台运行 gNB 与 UE | `sudo ./bin/lab radio both` |
+| 运行单次回合 | `./bin/lab sim run bowl`、`./bin/lab sim run two-objects` 或 `./bin/lab sim run drawer` |
+| 查看部署状态 | `./bin/lab status ran`、`./bin/lab status core`、`./bin/lab status edge` |
+
+`deploy` 用 systemd 的瞬态服务管理 gNB 和 UE。切换到前台启动前，用 `./bin/lab down ran` 停止它。手动前台启动时用 Ctrl+C 停止。完整停止顺序是 `down ran`、`down edge`、`down core`，数据库卷和权重缓存会保留。重启后运行同一条部署命令恢复 RAN。只重新启动无线侧可运行 `./bin/lab deploy ran`。
+
+如果希望先取源码，可以运行 `git submodule update --init --depth 1`。顶层仓库的 Gitlink 决定精确版本。需要 OAI 源码时查看 `vendor/oai/`，需要可执行程序时使用编译输出目录。MuJoCo 随锁定的 Python wheel 安装。核心网使用固定镜像摘要，推理服务使用 [Python 依赖锁](edge/requirements.lock)，仿真使用 [仿真依赖锁](sim/requirements.lock)。
+
+## 双机部署
+
+保持原实验拓扑。Linux A 运行 gNB、UE 和 LIBERO/MuJoCo，Linux B 运行核心网和 GPU 推理服务。两台服务器需要互通 IPv4，并允许 IPIP（IP 协议号 4）。核心网侧使用 Docker 的 iptables 后端。
+
+先生成一份双机站点文件，使用真实的互通地址，复制 `local/site.json` 到两台服务器的 checkout 下。
+
+```bash
+./bin/lab init --topology dual --ran-ip 192.0.2.10 --edge-ip 192.0.2.20 --gpu 0
 ./bin/lab plan
 ```
 
-`init` 生成匹配的实验 IMSI、K、OPc 和数据库密码，两端使用同一份文件。文件权限为 `0600`。第一次选定核心网项目名和凭据后保留配置，MySQL 数据卷跨重启保留。只重装 RAN 时，继续使用与现有核心网订阅匹配的 IMSI、K 和 OPc。可用 `--site /path/to/site.json` 或环境变量 `VLA_SITE` 选择其他站点文件，`--site` 放在子命令前。
-
-### Linux B · 核心网与边缘服务
+### Linux B · 核心网与边缘
 
 ```bash
-./bin/lab deps core
-./bin/lab deps edge
-./bin/lab doctor core
-./bin/lab doctor edge
-./bin/lab prepare core
-./bin/lab up core
-sudo ./bin/lab network core
-./bin/lab prepare edge
-./bin/lab up edge
-curl -fsS http://127.0.0.1:8000/healthz
+./bin/lab deploy core
+./bin/lab deploy edge
 ```
 
-`prepare edge` 构建推理镜像，`up edge` 等待模型初始化完成。默认把权重缓存到 `.state/edge/model-cache`。迁移时可以设置 `VLA_MODEL_CACHE=/absolute/path` 指向已有 OpenPI 缓存，至少在 `up edge` 时使用同一路径。也可用 `VLA_POLICY_IMAGE` 指向本机已有的兼容镜像，`up edge` 会使用该镜像的默认命令，须能在容器内监听 `0.0.0.0:8000` 并提供 `/healthz`。
-
-策略容器连到核心网 Docker bridge。主机回环端口用于本地检查，UE 走同一 bridge 上的策略容器地址。端口冲突时用 `init --policy-host-port` 设置回环端口。Compose 变量 `POLICY_PIP_INDEX` 和 `POLICY_WHEEL_ORIGIN` 分别选择 PyPI 索引和锁定大 wheel 的镜像站源站，后者需要兼容 `/packages/...` 路径。依赖仍接受 SHA-256 校验。已有部署的 PyPI wheel 缓存可用 `VLA_POLICY_WHEELHOUSE=/absolute/path` 传给 `prepare edge`，匹配文件仍按锁校验。
-
-### Linux A · gNB、UE 与 LIBERO
+### Linux A · 无线与仿真
 
 ```bash
-./bin/lab deps ran
-./bin/lab deps sim
-./bin/lab doctor ran
-./bin/lab doctor sim
-./bin/lab prepare ran --jobs 4
-./bin/lab prepare sim
-./bin/lab sim check
-sudo ./bin/lab network ran
-sudo ./bin/lab radio both
-```
-
-`radio both` 在同一个前台进程里先启 gNB 再启 UE。也可以用不同终端依次执行 `sudo ./bin/lab radio gnb` 和 `sudo ./bin/lab radio ue`。日志位置在启动时打印。Ctrl+C 结束该命令启动的 modem。裸机仿真默认使用 EGL，遇到无头渲染设备权限问题可在 Linux A 的站点文件中将 `mujoco_gl` 改为 `osmesa` 后执行 `sim check`，结果计时应记录渲染后端。
-
-保持 radio 终端运行，在第二个终端执行：
-
-```bash
+./bin/lab deploy sim
+./bin/lab deploy ran
 ./bin/lab sim probe
 ./bin/lab sim run bowl
 ```
 
-`sim probe` 先确认去往策略端点的路由走 `oaitun_ue1`，再从该 namespace 请求 `/healthz`。可加 `--throughput` 测 ext-dn 的上行和下行吞吐。它与回合推理可分别运行，方便区分 PDU 会话、用户面和策略问题。
+双机的 `deploy core` 和 `deploy ran` 会配置各自的 N2/N3 隧道。如果已经用旧版创建过站点文件，带双机地址的旧配置可继续使用。只替换 RAN 时保留原核心网订阅所对应的 IMSI、K 和 OPc。可用 `./bin/lab --site /path/to/site.json ...` 选择其他站点。双机拓扑和原数据面实验使用一致，核心网部署覆盖数据业务和压测。
 
-## 实验与恢复
+## 验收、实验和缓存
 
-| 操作 | 命令 |
-| --- | --- |
-| 查看当前站点拓扑 | `./bin/lab plan` |
-| 查看核心网和边缘服务状态 | `./bin/lab status core`、`./bin/lab status edge` |
-| 更换任务 | `./bin/lab sim run two-objects` 或 `./bin/lab sim run drawer` |
-| 更换起始状态或随机种子 | `./bin/lab sim run bowl --init-state 1 --seed 7` |
-| 用非 UE 路径做推理对照 | `./bin/lab sim run bowl --host 127.0.0.1 --port 8000`，需先建立可达的直连端点或 SSH 转发 |
-| 重新启动时切换无线条件 | 结束当前 radio 后运行 `sudo ./bin/lab radio both --profile ul32` 或 `--profile dl4` |
+- `sim probe` 先验证策略端点路由确实走 UE TUN，再访问 `/healthz`。加 `--throughput` 测 ext-dn 的上下行吞吐。可用 `sim run bowl --host 127.0.0.1 --port 8000` 执行本机策略直连对照。
+- `sim run bowl --init-state 1 --seed 7` 设置基准初始状态和种子。默认每轮采用状态 0、种子 7，并执行模型动作序列的前 5 步。客户端等待推理期间仿真步进暂停，墙钟时间和仿真时间应分开统计。
+- 前台 gNB 支持 `--profile full`、`--profile ul32` 和 `--profile dl4`。`full` 对应 106 PRB，`ul32` 保留连续上行 PRB 0–31 与上侧 PRB 98–105，`dl4` 将下行 MCS 上限设为 4。
+- 支持保留和复用已有 OpenPI 缓存。给 `deploy edge` 设置 `VLA_MODEL_CACHE` 指向已有权重，或用 `VLA_POLICY_IMAGE` 选择本机兼容镜像。镜像需在容器内监听 8000 并提供 `/healthz`。`VLA_POLICY_WHEELHOUSE`、`POLICY_PIP_INDEX`、`POLICY_WHEEL_ORIGIN` 可用于已有 wheel 缓存或镜像源。锁内文件仍按 SHA-256 校验。
+- 可用 `VLA_SOURCE_ARCHIVES` 复用 OpenPI、LIBERO、LeRobot 的 GitHub 源码归档缓存，命名为 `<组件>-<commit>.tar.gz`；其余组件仍走 Git submodule。默认尝试 submodule。OpenPI、LIBERO 或 LeRobot 的 Git 下载失败时，部署器自动从 GitHub 下载并核对同一提交的源码归档。
+- `local/`、`.state/`、`runs/` 和抓包由 Git 忽略。若已存在其他核心网实例，使用独立的站点名、Docker 网段、bridge 名和回环端口。单台主机同时运行一套 VRTSIM radio。
 
-`full` 是原 106 PRB 载波配置。 `ul32` 保留连续上行 PRB 0–31 和上侧 PRB 98–105，复用原实验保留 PUCCH 的口径。 `dl4` 将 gNB 下行 MCS 上限设为 4。默认种子 7、初始状态 0、每次执行动作序列前 5 步，策略最多返回 10 步。回合输出在 `runs/`，包含任务结果 JSON、视频、关键帧和客户端逐请求/逐步的 `trace.jsonl`。客户端等待推理时暂停仿真步进，墙钟时间与仿真时间要分别统计。
+## 参考与许可证
 
-- Linux B 重启后先确保 `up core` 和 `up edge` 就绪，再执行 `sudo ./bin/lab network core`。Linux A 重启后执行 `sudo ./bin/lab network ran` 并启动 radio。动态 IPIP 链路、窄范围防火墙规则和 UE 命名空间在运行时重建。
-- `./bin/lab down edge` 和 `./bin/lab down core` 停止容器并保留数据库卷与模型缓存。更换实验 IMSI、K、OPc 或数据库密码时用新的项目名和空数据库卷；健康检查会核对 MySQL 内实际注册的订阅。
-- 如需与现有平台并行运行，另选 `--project`、`--bridge-subnet`、`--bridge`、`--tunnel-subnet`、`--tunnel`、`--ue-namespace`、`--policy-host-port`。同一台 Linux A 在同一时刻仅启动一组 modem。基于同一个 underlay 地址对新建并行 IPIP 隧道可能冲突，切换链路前应沿用实际网络管理流程。
-- `local/`、`.state/`、`runs/` 和抓包在 Git 忽略规则中。模型缓存、Python 环境和编译产物都可由本仓库再次构建。此项目覆盖数据面推理和压测，现有测试床的 IMS 语音容器属于独立链路。
+系统依赖安装采用官方软件源。 [Docker Engine](https://docs.docker.com/engine/install/ubuntu/) · [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) · [Ubuntu NVIDIA 驱动](https://ubuntu.com/server/docs/how-to/graphics/install-nvidia-drivers/)
 
-## 源码与版本
-
-源码锁见 [config/sources.json](config/sources.json)。核心网镜像包含实验平台使用的 OAI CN5G v2.2.1 与 MySQL 9.6 摘要，见 [core/compose.yaml](core/compose.yaml)。仿真使用 Python 3.10、MuJoCo 3.2.3、robosuite 1.4.1 和 PyTorch 2.2 CPU。重装时可用 `VLA_SOURCE_ARCHIVES=/absolute/path` 指向已下载的 OpenPI、LIBERO 或 LeRobot GitHub 源码 tarball 缓存，命名为 `<组件>-<commit>.tar.gz`。边缘服务使用 Python 3.11.9、JAX 0.5.3 和 PyTorch 2.7.1，见 [edge/requirements.lock](edge/requirements.lock)。
-
-实验的 gNB/UE 使用 [Duranta OAI VRTSIM 源码](https://github.com/duranta-project/openairinterface5g/commit/88245ba846bd046720eb3503e17c297ec80c1606)。OpenPI 与 LIBERO 锁定为部署时的上游提交。[OpenPI](https://github.com/Physical-Intelligence/openpi/commit/215abfb217dbac7d5f1273282331b9b1866c0479) · [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO/commit/f78abd68ee283de9f9be3c8f7e2a9ad60246e95c)
-
-OAI 派生的配置和数据库模板使用 [OAI CSSL](licenses/OAI-CSSL)。单任务 LIBERO 客户端基于 Apache-2.0 OpenPI 示例，见 [OpenPI LICENSE](licenses/OpenPI-LICENSE)。上游代码、镜像和模型的许可证以各发布方为准。
+OAI 派生的配置和数据库模板使用 [OAI CSSL](licenses/OAI-CSSL)。单任务 LIBERO 客户端基于 Apache-2.0 OpenPI 示例，见 [OpenPI LICENSE](licenses/OpenPI-LICENSE)。上游代码、镜像和模型遵循各发布方的许可证。
 
 ## 验证记录
 
-2026-11-24 在 Ubuntu 22.04 实验服务器的临时目录完成验证。
+2026-11-25 的单机验证从 Git clone 初始化了 OAI、SIMDe、ASN.1 编译器，并从源码生成 gNB 和 UE。在隔离的 Ubuntu 环境中完成 PDU 会话建立，经 `oaitun_ue1` 使用已有 NVIDIA 驱动、固定核心网镜像和 π₀.₅ 权重缓存完成放碗回合。回合成功，生成了 MP4 和 18 条推理请求记录。
 
-| 组件 | 验证结果 |
-| --- | --- |
-| RAN | 从锁定提交编译出 gNB、UE、VRTSIM 和运行库 |
-| 5G 核心网 | 独立网段启动 AMF、SMF、UPF 等 9 个容器，全部通过健康检查 |
-| 边缘服务 | 从依赖锁构建新镜像，复用模型缓存启动并通过 `/healthz` |
-| LIBERO/MuJoCo | 新装 Python 环境通过离屏渲染。经跨机 SSH 直连调用新构建的 OpenPI 容器完成放碗回合，生成结果、录像和分段计时 |
-
-新项目的 IPIP 配置、PDU 会话和 UE 用户面回合仍需在拥有 sudo 权限的目标机上按首次部署流程验收。
+另一个空白 Ubuntu 虚拟机验证了 Docker Engine 与 Compose 插件的自动安装和 daemon 启动。测试网络到 Docker Hub 的连接被重置，冷拉镜像可使用具备访问条件的网络或镜像站。空白机上的 NVIDIA 驱动安装流程仍需在具有物理 GPU 的机器上验证。
