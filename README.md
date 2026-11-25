@@ -165,6 +165,7 @@ gNB 和 UE 是 Linux 原生进程。仿真客户端使用 Python 虚拟环境，
 | 从空白 Ubuntu 虚拟机自举 | 自动安装 Docker Engine 与 Compose 插件并启动 daemon。测试网络到 Docker Hub 的连接被重置，冷拉镜像需要可达的 registry 或镜像站。 |
 | RAN 清洁构建 | 从 Git 子模块取得 OAI、SIMDe 和 ASN.1 编译器，并在 Linux 上编译 gNB、UE 与 VRTSIM。 |
 | 单机 UE 用户面闭环 | 2026-11-25 建立 PDU 会话，通过 `oaitun_ue1` 访问 OpenPI 并完成放碗回合，生成 MP4 和 18 条推理请求记录。此次实测复用了 NVIDIA 驱动、固定核心网镜像和模型权重缓存。 |
+| 双机 UE 用户面闭环 | 2026-11-25 在 RAN 主机编译 gNB 和 UE，运行 LIBERO/MuJoCo，经 IPIP 接入另一台主机上的核心网和 π₀.₅。固定种子 7、初始状态 0 的放碗回合成功，推理期间观测到了双向 N3 流量。 |
 
 初次安装 NVIDIA 驱动的流程仍需在带物理 GPU 的空白主机上验证。
 

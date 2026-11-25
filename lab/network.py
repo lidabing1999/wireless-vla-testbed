@@ -93,6 +93,11 @@ def enable_forwarding(site):
     tunnel, bridge, peer = site["tunnel"], site["bridge"], site["ran_tunnel"]
     for key, proto, port in (("AMF", "sctp", "38412"), ("UPF", "udp", "2152")):
         target = site["addresses"][key]
+        # Docker's bridge rule can drop direct container traffic before DOCKER-USER.
+        if status("iptables", "-w", "-t", "raw", "-C", "PREROUTING", "-d", target,
+                  "!", "-i", bridge, "-j", "DROP") == 0:
+            iptables("PREROUTING", ["-i", tunnel, "-s", peer, "-d", target,
+                                    "-p", proto, "--dport", port, "-j", "ACCEPT"], table="raw")
         iptables("DOCKER-USER", ["-i", tunnel, "-o", bridge, "-s", peer, "-d", target,
                                  "-p", proto, "--dport", port, "-j", "ACCEPT"])
         reply = ["-o", tunnel, "-s", target, "-d", peer, "-p", proto, "--sport", port]
